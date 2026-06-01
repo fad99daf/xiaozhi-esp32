@@ -21,6 +21,14 @@
 #include "blufi.h"
 #endif
 
+#if CONFIG_TUYA_BLE_PROVISIONING
+#include "tuya_ble_prov_wrapper.h"
+#include <esp_system.h>
+extern "C" {
+#include "esp_bt.h"
+}
+#endif
+
 static const char *TAG = "WifiBoard";
 
 // Connection timeout in seconds
@@ -91,11 +99,40 @@ void WifiBoard::TryWifiConnect() {
     bool have_ssid = !ssid_manager.GetSsidList().empty();
 
     if (have_ssid) {
+#if CONFIG_TUYA_BLE_PROVISIONING
+        // BT not needed once SSID is present — release memory for WiFi/TLS
+        esp_bt_mem_release(ESP_BT_MODE_BLE);
+#endif
         // Start connection attempt with timeout
         ESP_LOGI(TAG, "Starting WiFi connection attempt");
         esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL);
         WifiManager::GetInstance().StartStation();
     } else {
+#if CONFIG_TUYA_BLE_PROVISIONING
+        // BLE-only provisioning: no fallback to SoftAP
+        Application::GetInstance().SetDeviceState(kDeviceStateWifiConfiguring);
+        Application::GetInstance().Alert(
+            Lang::Strings::WIFI_CONFIG_MODE,
+            Lang::Strings::ENTERING_WIFI_CONFIG_MODE,
+            "gear",
+            Lang::Sounds::OGG_WIFICONFIG);
+
+        while (true) {
+            BleProvResult ble_result;
+            if (TuyaBleProvision(60000, ble_result)) {
+                ssid_manager.AddSsid(ble_result.ssid, ble_result.password);
+                {
+                    Settings settings("tuya", true);
+                    settings.SetString("ble_token", ble_result.token);
+                }
+                esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL);
+                WifiManager::GetInstance().StartStation();
+                return;
+            }
+            // BLE timed out, show notification and retry
+            GetDisplay()->ShowNotification("BLE配网超时，重试中...", 3000);
+        }
+#endif
         // No SSID configured, enter config mode
         // Wait for the board version to be shown
         vTaskDelay(pdMS_TO_TICKS(1500));
@@ -198,6 +235,18 @@ void WifiBoard::StartWifiConfigMode() {
 
 void WifiBoard::EnterWifiConfigMode() {
     ESP_LOGI(TAG, "EnterWifiConfigMode called");
+#if CONFIG_TUYA_BLE_PROVISIONING
+    // Clear Tuya on-boarded credentials and WiFi so BLE provisioning re-runs on next boot
+    {
+        Settings settings("tuya", true);
+        settings.EraseAll();
+    }
+    SsidManager::GetInstance().Clear();
+    GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+    return;
+#endif
     GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
 
     auto& app = Application::GetInstance();

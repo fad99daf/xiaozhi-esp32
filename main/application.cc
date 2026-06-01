@@ -5,6 +5,7 @@
 #include "audio_codec.h"
 #include "mqtt_protocol.h"
 #include "websocket_protocol.h"
+#include "tuya_protocol.h"
 #include "assets/lang_config.h"
 #include "mcp_server.h"
 #include "assets.h"
@@ -396,6 +397,9 @@ void Application::CheckAssetsVersion() {
 }
 
 void Application::CheckNewVersion() {
+#if CONFIG_PROTOCOL_TUYA
+    ota_->MarkCurrentVersionValid();
+#else
     const int MAX_RETRY = 10;
     int retry_count = 0;
     int retry_delay = 10; // Initial retry delay in seconds
@@ -468,6 +472,7 @@ void Application::CheckNewVersion() {
             }
         }
     }
+#endif
 }
 
 void Application::InitializeProtocol() {
@@ -477,7 +482,12 @@ void Application::InitializeProtocol() {
 
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
-    if (ota_->HasMqttConfig()) {
+#if CONFIG_PROTOCOL_TUYA
+    protocol_ = std::make_unique<TuyaProtocol>();
+#else
+    if (ota_->HasTuyaConfig()) {
+        protocol_ = std::make_unique<TuyaProtocol>();
+    } else if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
     } else if (ota_->HasWebsocketConfig()) {
         protocol_ = std::make_unique<WebsocketProtocol>();
@@ -485,6 +495,7 @@ void Application::InitializeProtocol() {
         ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
         protocol_ = std::make_unique<MqttProtocol>();
     }
+#endif
 
     protocol_->OnConnected([this]() {
         DismissAlert();
@@ -496,8 +507,22 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking) {
-            audio_service_.PushPacketToDecodeQueue(std::move(packet));
+        if (GetDeviceState() == kDeviceStateSpeaking && !aborted_) {
+            // Non-blocking: the TAI receive thread must never block here, otherwise
+            // CHAT_BREAK events cannot be delivered for barge-in.
+            // The decode queue is sized large enough (24s) to absorb server bursts.
+            if (!audio_service_.PushPacketToDecodeQueue(std::move(packet), false)) {
+                static int overflow_count = 0;
+                if (++overflow_count % 50 == 1) {
+                    ESP_LOGW(TAG, "[BARGE-IN] Decode queue overflow, dropping packet (count=%d)", overflow_count);
+                }
+            }
+        } else {
+            static int reject_count = 0;
+            if (++reject_count % 50 == 1) {
+                ESP_LOGD(TAG, "[BARGE-IN] Audio rejected: state=%d aborted=%d, count=%d",
+                         (int)GetDeviceState(), (int)aborted_, reject_count);
+            }
         }
     });
     
@@ -537,6 +562,16 @@ void Application::InitializeProtocol() {
                             SetDeviceState(kDeviceStateListening);
                         }
                     }
+                });
+            } else if (strcmp(state->valuestring, "abort") == 0) {
+                // Chat-break: user interrupted TTS -- flush immediately.
+                ESP_LOGW(TAG, "[BARGE-IN] TTS abort received, flushing audio (state=%d)", (int)GetDeviceState());
+                aborted_ = true;
+                audio_service_.AbortOutput();
+                Board::GetInstance().GetAudioCodec()->ClearOutputBuffer();
+                Schedule([this]() {
+                    ESP_LOGI(TAG, "[BARGE-IN] Transitioning to listening after abort");
+                    SetDeviceState(kDeviceStateListening);
                 });
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
                 auto text = cJSON_GetObjectItem(root, "text");
@@ -601,6 +636,14 @@ void Application::InitializeProtocol() {
                 ESP_LOGW(TAG, "Invalid custom message format: missing payload");
             }
 #endif
+        } else if (strcmp(type->valuestring, "vad") == 0) {
+            auto state = cJSON_GetObjectItem(root, "state");
+            if (cJSON_IsString(state) && strcmp(state->valuestring, "stop") == 0) {
+                // In realtime mode, do NOT send audio_end — the server handles
+                // VAD internally and needs the audio stream to stay open for
+                // barge-in detection during TTS playback.
+                ESP_LOGI(TAG, "Server VAD: end of speech detected");
+            }
         } else {
             ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
         }
@@ -884,17 +927,20 @@ void Application::HandleStateChangedEvent() {
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
 
+            // For auto mode, wait for playback queue to be empty before enabling voice processing
+            // This prevents audio truncation when STOP arrives late due to network jitter
+            if (listening_mode_ == kListeningModeAutoStop) {
+                audio_service_.WaitForPlaybackQueueEmpty();
+            }
+            
             // Make sure the audio processor is running
-            if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
-                // For auto mode, wait for playback queue to be empty before enabling voice processing
-                // This prevents audio truncation when STOP arrives late due to network jitter
-                if (listening_mode_ == kListeningModeAutoStop) {
-                    audio_service_.WaitForPlaybackQueueEmpty();
-                }
-                
-                // Send the start listening command
-                protocol_->SendStartListening(listening_mode_);
+            if (!audio_service_.IsAudioProcessorRunning()) {
                 audio_service_.EnableVoiceProcessing(true);
+                // Send audio_start only when first opening the stream
+                protocol_->SendStartListening(listening_mode_);
+            } else if (listening_mode_ != kListeningModeRealtime) {
+                // Non-realtime modes close the stream each turn, so re-open
+                protocol_->SendStartListening(listening_mode_);
             }
 
 #ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
@@ -940,8 +986,10 @@ void Application::Schedule(std::function<void()>&& callback) {
 }
 
 void Application::AbortSpeaking(AbortReason reason) {
-    ESP_LOGI(TAG, "Abort speaking");
+    ESP_LOGW(TAG, "[BARGE-IN] AbortSpeaking called (reason=%d, state=%d)", reason, (int)GetDeviceState());
     aborted_ = true;
+    audio_service_.AbortOutput();
+    Board::GetInstance().GetAudioCodec()->ClearOutputBuffer();
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
     }

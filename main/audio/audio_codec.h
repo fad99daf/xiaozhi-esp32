@@ -27,6 +27,7 @@ public:
     virtual void OutputData(std::vector<int16_t>& data);
     virtual bool InputData(std::vector<int16_t>& data);
     virtual void Start();
+    virtual void ClearOutputBuffer();
 
     inline bool duplex() const { return duplex_; }
     inline bool input_reference() const { return input_reference_; }

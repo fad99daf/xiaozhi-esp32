@@ -36,10 +36,11 @@
  * 
  */
 
-#define OPUS_FRAME_DURATION_MS 60
+#define OPUS_FRAME_DURATION_MS 40
+#define OPUS_MAX_FRAME_DURATION_MS 120
 #define MAX_ENCODE_TASKS_IN_QUEUE 2
 #define MAX_PLAYBACK_TASKS_IN_QUEUE 2
-#define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
+#define MAX_DECODE_PACKETS_IN_QUEUE (24000 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
 #define MAX_TIMESTAMPS_IN_QUEUE 3
@@ -66,13 +67,13 @@
         .sample_rate        = ESP_AUDIO_SAMPLE_RATE_16K,                                                          \
         .channel            = ESP_AUDIO_MONO,                                                                     \
         .bits_per_sample    = ESP_AUDIO_BIT16,                                                                    \
-        .bitrate            = ESP_OPUS_BITRATE_AUTO,                                                              \
+        .bitrate            = 16000,                                                                              \
         .frame_duration     = (esp_opus_enc_frame_duration_t)AS_OPUS_GET_FRAME_DRU_ENUM(OPUS_FRAME_DURATION_MS),  \
-        .application_mode   = ESP_OPUS_ENC_APPLICATION_AUDIO,                                                     \
+        .application_mode   = ESP_OPUS_ENC_APPLICATION_VOIP,                                                      \
         .complexity         = 0,                                                                                  \
         .enable_fec         = false,                                                                              \
-        .enable_dtx         = true,                                                                               \
-        .enable_vbr         = true,                                                                               \
+        .enable_dtx         = false,                                                                              \
+        .enable_vbr         = false,                                                                              \
     }
 
 struct AudioServiceCallbacks {
@@ -133,6 +134,8 @@ public:
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
+    void AbortOutput();
+    void FlushAudioQueues();
 
 private:
     AudioCodec* codec_ = nullptr;
@@ -179,6 +182,7 @@ private:
     bool voice_detected_ = false;
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;
+    bool output_aborted_ = false;
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;

@@ -1,0 +1,3 @@
+[submodule "components/esp-agentic-kit"]
+	path = components/esp-agentic-kit
+	url = https://github.com/sedawwk/esp-agentic-kit.git

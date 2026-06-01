@@ -65,3 +65,10 @@ void AudioCodec::EnableOutput(bool enable) {
     output_enabled_ = enable;
     ESP_LOGI(TAG, "Set output enable to %s", enable ? "true" : "false");
 }
+
+void AudioCodec::ClearOutputBuffer() {
+    if (tx_handle_) {
+        i2s_channel_disable(tx_handle_);
+        i2s_channel_enable(tx_handle_);
+    }
+}

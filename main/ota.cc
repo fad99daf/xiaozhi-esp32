@@ -185,6 +185,27 @@ esp_err_t Ota::CheckVersion() {
         ESP_LOGI(TAG, "No websocket section found!");
     }
 
+    has_tuya_config_ = false;
+    cJSON *tuya = cJSON_GetObjectItem(root, "tuya");
+    if (cJSON_IsObject(tuya)) {
+        Settings settings("tuya", true);
+        cJSON *item = NULL;
+        cJSON_ArrayForEach(item, tuya) {
+            if (cJSON_IsString(item)) {
+                if (settings.GetString(item->string) != item->valuestring) {
+                    settings.SetString(item->string, item->valuestring);
+                }
+            } else if (cJSON_IsNumber(item)) {
+                if (settings.GetInt(item->string) != item->valueint) {
+                    settings.SetInt(item->string, item->valueint);
+                }
+            }
+        }
+        has_tuya_config_ = true;
+    } else {
+        ESP_LOGI(TAG, "No tuya section found!");
+    }
+
     has_server_time_ = false;
     cJSON *server_time = cJSON_GetObjectItem(root, "server_time");
     if (cJSON_IsObject(server_time)) {

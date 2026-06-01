@@ -70,7 +70,11 @@ void AudioService::Initialize(AudioCodec* codec) {
     } else {
         decoder_sample_rate_ = codec->output_sample_rate();
         decoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
-        decoder_frame_size_ = decoder_sample_rate_ / 1000 * OPUS_FRAME_DURATION_MS;
+        // Size the output buffer for the largest possible opus frame (120ms).
+        // The configured frame_duration is only a hint; the actual decoded frame
+        // (e.g. Tuya TTS 60ms frames) may be larger and would overflow a buffer
+        // sized to OPUS_FRAME_DURATION_MS, causing ESP_AUDIO_ERR_BUFF_NOT_ENOUGH.
+        decoder_frame_size_ = decoder_sample_rate_ / 1000 * OPUS_MAX_FRAME_DURATION_MS;
     }
     esp_opus_enc_config_t opus_enc_cfg = AS_OPUS_ENC_CONFIG();
     ret = esp_opus_enc_open(&opus_enc_cfg, sizeof(esp_opus_enc_config_t), &opus_encoder_);
@@ -81,6 +85,10 @@ void AudioService::Initialize(AudioCodec* codec) {
         encoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
         esp_opus_enc_get_frame_size(opus_encoder_, &encoder_frame_size_, &encoder_outbuf_size_);
         encoder_frame_size_ = encoder_frame_size_ / sizeof(int16_t);
+        ESP_LOGI(TAG, "Opus encoder opened: in_frame=%d samples, out_buf=%d bytes, cfg(vbr=%d, dtx=%d, bitrate=%d, app=%d)",
+                 encoder_frame_size_, encoder_outbuf_size_,
+                 opus_enc_cfg.enable_vbr, opus_enc_cfg.enable_dtx,
+                 opus_enc_cfg.bitrate, opus_enc_cfg.application_mode);
     }
 
     if (codec->input_sample_rate() != 16000) {
@@ -99,7 +107,30 @@ void AudioService::Initialize(AudioCodec* codec) {
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
-        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+        // Non-blocking push: drop frames rather than blocking the AFE fetch thread.
+        // Blocking here causes the AFE internal ring buffer to overflow (no fetch calls),
+        // which breaks AEC and prevents server-side barge-in detection.
+        std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+        if (audio_encode_queue_.size() >= MAX_ENCODE_TASKS_IN_QUEUE) {
+            static int drop_count = 0;
+            if (++drop_count % 50 == 1) {
+                ESP_LOGW(TAG, "[BARGE-IN] AFE output dropped (enc_q=%d, send_q=%d, dec_q=%d, play_q=%d, drops=%d)",
+                         (int)audio_encode_queue_.size(), (int)audio_send_queue_.size(),
+                         (int)audio_decode_queue_.size(), (int)audio_playback_queue_.size(), drop_count);
+            }
+            return;
+        }
+        auto task = std::make_unique<AudioTask>();
+        task->type = kAudioTaskTypeEncodeToSendQueue;
+        task->pcm = std::move(data);
+        if (!timestamp_queue_.empty()) {
+            if (timestamp_queue_.size() <= MAX_TIMESTAMPS_IN_QUEUE) {
+                task->timestamp = timestamp_queue_.front();
+            }
+            timestamp_queue_.pop_front();
+        }
+        audio_encode_queue_.push_back(std::move(task));
+        audio_queue_cv_.notify_all();
     });
 
     audio_processor_->OnVadStateChange([this](bool speaking) {
@@ -300,6 +331,12 @@ void AudioService::AudioOutputTask() {
         audio_queue_cv_.notify_all();
         lock.unlock();
 
+        // Check abort before playing — discards any frame already popped
+        // from the queue before ResetDecoder() cleared it.
+        if (output_aborted_) {
+            continue;
+        }
+
         if (!codec_->output_enabled()) {
             esp_timer_stop(audio_power_timer_);
             esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
@@ -364,6 +401,14 @@ void AudioService::OpusCodecTask() {
                 esp_audio_dec_info_t dec_info = {};
                 std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
                 auto ret = esp_opus_dec_decode(opus_decoder_, &raw, &out_frame, &dec_info);
+                // If the output buffer was too small, grow it to the reported
+                // needed_size and retry once (matches esp_audio_codec usage).
+                if (ret == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH && out_frame.needed_size > 0) {
+                    task->pcm.resize(out_frame.needed_size / sizeof(int16_t));
+                    out_frame.buffer = (uint8_t *)(task->pcm.data());
+                    out_frame.len = (uint32_t)(task->pcm.size() * sizeof(int16_t));
+                    ret = esp_opus_dec_decode(opus_decoder_, &raw, &out_frame, &dec_info);
+                }
                 decoder_lock.unlock();
                 if (ret == ESP_AUDIO_ERR_OK) {
                     task->pcm.resize(out_frame.decoded_size / sizeof(int16_t));
@@ -378,6 +423,13 @@ void AudioService::OpusCodecTask() {
                         task->pcm = std::move(resampled);
                     }
                     lock.lock();
+                    // Check abort before pushing to playback — this prevents the race
+                    // where ResetDecoder() cleared the queues but a decode was already
+                    // in-flight (frame popped before the clear).
+                    if (output_aborted_) {
+                        lock.unlock();
+                        continue;
+                    }
                     audio_playback_queue_.push_back(std::move(task));
                     audio_queue_cv_.notify_all();
                     debug_statistics_.decode_count++;
@@ -417,6 +469,12 @@ void AudioService::OpusCodecTask() {
                 auto ret = esp_opus_enc_process(opus_encoder_, &in, &out);
                 if (ret == ESP_AUDIO_ERR_OK) {
                     packet->payload.assign(buf.data(), buf.data() + out.encoded_bytes);
+                    // Log every 50th frame to verify CBR output
+                    static int enc_log_cnt = 0;
+                    if (++enc_log_cnt % 50 == 1) {
+                        ESP_LOGI(TAG, "Encoded frame #%d: %u bytes (CBR expects ~120 bytes for 60ms@16kbps)",
+                                 enc_log_cnt, (unsigned)out.encoded_bytes);
+                    }
 
                     if (task->type == kAudioTaskTypeEncodeToSendQueue) {
                         {
@@ -463,7 +521,8 @@ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
     }
     decoder_sample_rate_ = sample_rate;
     decoder_duration_ms_ = frame_duration;
-    decoder_frame_size_ = decoder_sample_rate_ / 1000 * frame_duration;
+    // Size for the largest opus frame (120ms), not the negotiated frame_duration.
+    decoder_frame_size_ = decoder_sample_rate_ / 1000 * OPUS_MAX_FRAME_DURATION_MS;
 
     auto codec = Board::GetInstance().GetAudioCodec();
     if (decoder_sample_rate_ != codec->output_sample_rate()) {
@@ -507,7 +566,13 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
     if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
         if (wait) {
-            audio_queue_cv_.wait(lock, [this]() { return audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE; });
+            ESP_LOGW(TAG, "[BARGE-IN] Decode queue full (%d), blocking TAI recv thread (send_q=%d, enc_q=%d, play_q=%d)",
+                     (int)audio_decode_queue_.size(), (int)audio_send_queue_.size(),
+                     (int)audio_encode_queue_.size(), (int)audio_playback_queue_.size());
+            audio_queue_cv_.wait(lock, [this]() {
+                return service_stopped_ || audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE;
+            });
+            if (service_stopped_) return false;
         } else {
             return false;
         }
@@ -644,7 +709,7 @@ void AudioService::PlaySound(const std::string_view& ogg) {
     demuxer->OnDemuxerFinished([this](const uint8_t* data, int sample_rate, size_t size){
         auto packet = std::make_unique<AudioStreamPacket>();
         packet->sample_rate = sample_rate;
-        packet->frame_duration = 60;
+        packet->frame_duration = OPUS_FRAME_DURATION_MS;
         packet->payload.resize(size);
         std::memcpy(packet->payload.data(), data, size);
         PushPacketToDecodeQueue(std::move(packet), true);
@@ -672,10 +737,34 @@ void AudioService::ResetDecoder() {
         esp_opus_dec_reset(opus_decoder_);
     }
     decoder_lock.unlock();
+    output_aborted_ = false;
     timestamp_queue_.clear();
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
     audio_testing_queue_.clear();
+    audio_queue_cv_.notify_all();
+}
+
+void AudioService::FlushAudioQueues() {
+    // Like ResetDecoder but without clearing decoder state or setting
+    // output_aborted_ — just drains the queues.  Used for normal state
+    // transitions where we want fresh queues but not an abort signal.
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    audio_decode_queue_.clear();
+    audio_playback_queue_.clear();
+    audio_testing_queue_.clear();
+    audio_queue_cv_.notify_all();
+}
+
+void AudioService::AbortOutput() {
+    // Stop audio output immediately: clear all queues and signal the
+    // worker tasks to drop any frames that were already popped before
+    // the clear.  Called from Application::AbortSpeaking / CHAT_BREAK handler.
+    ESP_LOGW(TAG, "AbortOutput: clearing %d decode + %d playback packets",
+             (int)audio_decode_queue_.size(), (int)audio_playback_queue_.size());
+    output_aborted_ = true;
+    audio_decode_queue_.clear();
+    audio_playback_queue_.clear();
     audio_queue_cv_.notify_all();
 }
 

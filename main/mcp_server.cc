@@ -375,11 +375,17 @@ void McpServer::ParseMessage(const cJSON* json) {
     }
 
     auto id = cJSON_GetObjectItem(json, "id");
-    if (id == nullptr || !cJSON_IsNumber(id)) {
+    if (id == nullptr || (!cJSON_IsNumber(id) && !cJSON_IsString(id))) {
         ESP_LOGE(TAG, "Invalid id for method: %s", method_str.c_str());
         return;
     }
-    auto id_int = id->valueint;
+    // JSON-RPC 2.0 allows id to be a string or number; echo it back verbatim.
+    std::string id_literal;
+    if (cJSON_IsString(id)) {
+        id_literal = std::string("\"") + id->valuestring + "\"";
+    } else {
+        id_literal = std::to_string(id->valueint);
+    }
     
     if (method_str == "initialize") {
         if (cJSON_IsObject(params)) {
@@ -392,7 +398,7 @@ void McpServer::ParseMessage(const cJSON* json) {
         std::string message = "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"" BOARD_NAME "\",\"version\":\"";
         message += app_desc->version;
         message += "\"}}";
-        ReplyResult(id_int, message);
+        ReplyResult(id_literal, message);
     } else if (method_str == "tools/list") {
         std::string cursor_str = "";
         bool list_user_only_tools = false;
@@ -406,50 +412,50 @@ void McpServer::ParseMessage(const cJSON* json) {
                 list_user_only_tools = with_user_tools->valueint == 1;
             }
         }
-        GetToolsList(id_int, cursor_str, list_user_only_tools);
+        GetToolsList(id_literal, cursor_str, list_user_only_tools);
     } else if (method_str == "tools/call") {
         if (!cJSON_IsObject(params)) {
             ESP_LOGE(TAG, "tools/call: Missing params");
-            ReplyError(id_int, "Missing params");
+            ReplyError(id_literal, "Missing params");
             return;
         }
         auto tool_name = cJSON_GetObjectItem(params, "name");
         if (!cJSON_IsString(tool_name)) {
             ESP_LOGE(TAG, "tools/call: Missing name");
-            ReplyError(id_int, "Missing name");
+            ReplyError(id_literal, "Missing name");
             return;
         }
         auto tool_arguments = cJSON_GetObjectItem(params, "arguments");
         if (tool_arguments != nullptr && !cJSON_IsObject(tool_arguments)) {
             ESP_LOGE(TAG, "tools/call: Invalid arguments");
-            ReplyError(id_int, "Invalid arguments");
+            ReplyError(id_literal, "Invalid arguments");
             return;
         }
-        DoToolCall(id_int, std::string(tool_name->valuestring), tool_arguments);
+        DoToolCall(id_literal, std::string(tool_name->valuestring), tool_arguments);
     } else {
         ESP_LOGE(TAG, "Method not implemented: %s", method_str.c_str());
-        ReplyError(id_int, "Method not implemented: " + method_str);
+        ReplyError(id_literal, "Method not implemented: " + method_str);
     }
 }
 
-void McpServer::ReplyResult(int id, const std::string& result) {
+void McpServer::ReplyResult(const std::string& id_literal, const std::string& result) {
     std::string payload = "{\"jsonrpc\":\"2.0\",\"id\":";
-    payload += std::to_string(id) + ",\"result\":";
+    payload += id_literal + ",\"result\":";
     payload += result;
     payload += "}";
     Application::GetInstance().SendMcpMessage(payload);
 }
 
-void McpServer::ReplyError(int id, const std::string& message) {
+void McpServer::ReplyError(const std::string& id_literal, const std::string& message) {
     std::string payload = "{\"jsonrpc\":\"2.0\",\"id\":";
-    payload += std::to_string(id);
+    payload += id_literal;
     payload += ",\"error\":{\"message\":\"";
     payload += message;
     payload += "\"}}";
     Application::GetInstance().SendMcpMessage(payload);
 }
 
-void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_only_tools) {
+void McpServer::GetToolsList(const std::string& id_literal, const std::string& cursor, bool list_user_only_tools) {
     const int max_payload_size = 8000;
     std::string json = "{\"tools\":[";
     
@@ -492,7 +498,7 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
     if (json.back() == '[' && !tools_.empty()) {
         // 如果没有添加任何tool，返回错误
         ESP_LOGE(TAG, "tools/list: Failed to add tool %s because of payload size limit", next_cursor.c_str());
-        ReplyError(id, "Failed to add tool " + next_cursor + " because of payload size limit");
+        ReplyError(id_literal, "Failed to add tool " + next_cursor + " because of payload size limit");
         return;
     }
 
@@ -502,10 +508,10 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
         json += "],\"nextCursor\":\"" + next_cursor + "\"}";
     }
     
-    ReplyResult(id, json);
+    ReplyResult(id_literal, json);
 }
 
-void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments) {
+void McpServer::DoToolCall(const std::string& id_literal, const std::string& tool_name, const cJSON* tool_arguments) {
     auto tool_iter = std::find_if(tools_.begin(), tools_.end(), 
                                  [&tool_name](const McpTool* tool) { 
                                      return tool->name() == tool_name; 
@@ -513,7 +519,7 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
     
     if (tool_iter == tools_.end()) {
         ESP_LOGE(TAG, "tools/call: Unknown tool: %s", tool_name.c_str());
-        ReplyError(id, "Unknown tool: " + tool_name);
+        ReplyError(id_literal, "Unknown tool: " + tool_name);
         return;
     }
 
@@ -537,24 +543,24 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
 
             if (!argument.has_default_value() && !found) {
                 ESP_LOGE(TAG, "tools/call: Missing valid argument: %s", argument.name().c_str());
-                ReplyError(id, "Missing valid argument: " + argument.name());
+                ReplyError(id_literal, "Missing valid argument: " + argument.name());
                 return;
             }
         }
     } catch (const std::exception& e) {
         ESP_LOGE(TAG, "tools/call: %s", e.what());
-        ReplyError(id, e.what());
+        ReplyError(id_literal, e.what());
         return;
     }
 
     // Use main thread to call the tool
     auto& app = Application::GetInstance();
-    app.Schedule([this, id, tool_iter, arguments = std::move(arguments)]() {
+    app.Schedule([this, id_literal, tool_iter, arguments = std::move(arguments)]() {
         try {
-            ReplyResult(id, (*tool_iter)->Call(arguments));
+            ReplyResult(id_literal, (*tool_iter)->Call(arguments));
         } catch (const std::exception& e) {
             ESP_LOGE(TAG, "tools/call: %s", e.what());
-            ReplyError(id, e.what());
+            ReplyError(id_literal, e.what());
         }
     });
 }

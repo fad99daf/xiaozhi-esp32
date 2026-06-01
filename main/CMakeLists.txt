@@ -29,6 +29,7 @@ set(SOURCES "audio/audio_codec.cc"
             "protocols/protocol.cc"
             "protocols/mqtt_protocol.cc"
             "protocols/websocket_protocol.cc"
+            "protocols/tuya_protocol.cc"
             "mcp_server.cc"
             "system_info.cc"
             "application.cc"
@@ -39,7 +40,7 @@ set(SOURCES "audio/audio_codec.cc"
             "main.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "provisioning")
 
 # Add board common files
 list(APPEND SOURCES
@@ -62,6 +63,35 @@ list(APPEND SOURCES
     "boards/common/system_reset.cc"
 )
 list(APPEND INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boards/common)
+
+# Generate tuya_authkey.h from tuya_authkey.txt when the Tuya protocol is selected
+if(CONFIG_PROTOCOL_TUYA)
+    set(_TUYA_AUTHKEY_TXT "${PROJECT_DIR}/tuya_authkey.txt")
+    if(NOT EXISTS "${_TUYA_AUTHKEY_TXT}")
+        message(FATAL_ERROR "PROTOCOL_TUYA enabled but ${_TUYA_AUTHKEY_TXT} not found")
+    endif()
+    file(STRINGS "${_TUYA_AUTHKEY_TXT}" _ak_lines)
+    foreach(_line ${_ak_lines})
+        if(_line MATCHES "^TUYA_UUID=(.+)$")
+            set(_TUYA_UUID "${CMAKE_MATCH_1}")
+        elseif(_line MATCHES "^TUYA_AUTH_KEY=(.+)$")
+            set(_TUYA_AUTH_KEY "${CMAKE_MATCH_1}")
+        elseif(_line MATCHES "^TUYA_PRODUCT_KEY=(.+)$")
+            set(_TUYA_PRODUCT_KEY "${CMAKE_MATCH_1}")
+        endif()
+    endforeach()
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/tuya_authkey.h"
+        "#ifndef TUYA_AUTHKEY_H\n"
+        "#define TUYA_AUTHKEY_H\n"
+        "\n"
+        "#define TUYA_UUID        \"${_TUYA_UUID}\"\n"
+        "#define TUYA_AUTH_KEY    \"${_TUYA_AUTH_KEY}\"\n"
+        "#define TUYA_PRODUCT_KEY \"${_TUYA_PRODUCT_KEY}\"\n"
+        "\n"
+        "#endif\n"
+    )
+    list(APPEND INCLUDE_DIRS "${CMAKE_CURRENT_BINARY_DIR}")
+endif()
 
 
 idf_build_get_property(build_components BUILD_COMPONENTS)
@@ -858,6 +888,10 @@ endif()
 if (CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING)
     list(APPEND SOURCES "boards/common/blufi.cpp")
 endif ()
+if(CONFIG_TUYA_BLE_PROVISIONING)
+    list(APPEND SOURCES "provisioning/tuya_ble_prov_wrapper.cc")
+    list(APPEND SOURCES "provisioning/tuya_ble_nimble.c")
+endif()
 # Select language directory according to Kconfig
 if(CONFIG_LANGUAGE_ZH_CN)
     set(LANG_DIR "zh-CN")
@@ -1023,8 +1057,18 @@ idf_component_register(SRCS ${SOURCES}
                         efuse
                         bt
                         fatfs
+                        esp-agentic-kit
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
+
+# Override TAI buffer sizes for ESP32 RAM constraints (upstream defaults are 64-128KB each)
+idf_component_get_property(agentic_kit_lib esp-agentic-kit COMPONENT_LIB)
+target_compile_definitions(${agentic_kit_lib} PRIVATE
+    TAI_RX_BUF_SIZE=16384
+    TAI_FRAG_BUF_SIZE=32768
+    TAI_TX_APP_BUF_SIZE=16384
+    TAI_TX_FRAME_BUF_SIZE=16448
+)
 
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
 # If BOARD_NAME is empty, use BOARD_TYPE

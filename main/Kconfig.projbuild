@@ -980,4 +980,31 @@ menu "TAIJIPAI_S3_CONFIG"
         启动双声道
 endmenu
 
+choice IOT_PROTOCOL
+    prompt "IoT Protocol"
+    default IOT_PROTOCOL_MCP
+    help
+        IoT protocol for reading device state and sending control commands
+    config IOT_PROTOCOL_MCP
+        bool "MCP 2024-11-05"
+    config IOT_PROTOCOL_XIAOZHI
+        bool "Xiaozhi IoT 1.0 (Deprecated)"
+endchoice
+
+config PROTOCOL_TUYA
+    bool "Use Tuya AI 2.1 Protocol"
+    default n
+    help
+        Connect to Tuya AI cloud via the v2.1 binary protocol (ai-tcp-sdk).
+        When enabled, MQTT/WebSocket protocol selection from OTA config is ignored.
+
+config TUYA_BLE_PROVISIONING
+    bool "Use Tuya BLE for WiFi Provisioning"
+    default y
+    depends on PROTOCOL_TUYA
+    help
+        First-boot WiFi provisioning via Tuya BLE pairing.
+        Falls back to SoftAP if BLE pairing times out (60s).
+        Requires NimBLE.
+
 endmenu

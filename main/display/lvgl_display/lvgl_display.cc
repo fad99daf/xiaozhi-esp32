@@ -143,7 +143,9 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
                 char time_str[16];
                 strftime(time_str, sizeof(time_str), "%H:%M", tm);
                 SetStatus(time_str);
+                last_status_update_time_ = std::chrono::system_clock::now();
             } else {
+                last_status_update_time_ = std::chrono::system_clock::now();
                 ESP_LOGW(TAG, "System time is not set, tm_year: %d", tm->tm_year);
             }
         }
