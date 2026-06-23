@@ -23,6 +23,7 @@
 
 #if CONFIG_TUYA_BLE_PROVISIONING
 #include "tuya_ble_prov_wrapper.h"
+#include "tuya_protocol.h"
 #include <esp_system.h>
 extern "C" {
 #include "esp_bt.h"
@@ -121,13 +122,36 @@ void WifiBoard::TryWifiConnect() {
             BleProvResult ble_result;
             if (TuyaBleProvision(60000, ble_result)) {
                 ssid_manager.AddSsid(ble_result.ssid, ble_result.password);
-                {
-                    Settings settings("tuya", true);
-                    settings.SetString("ble_token", ble_result.token);
-                }
                 esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL);
                 WifiManager::GetInstance().StartStation();
-                return;
+
+                // Wait for WiFi connection before on-boarding (requires network)
+                int waited = 0;
+                while (waited < CONNECT_TIMEOUT_SEC * 1000 && !WifiManager::GetInstance().IsConnected()) {
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    waited += 200;
+                }
+
+                if (!WifiManager::GetInstance().IsConnected()) {
+                    ESP_LOGE(TAG, "WiFi not connected after provisioning, cannot on-board");
+                    GetDisplay()->ShowNotification("WiFi连接失败，重启...", 3000);
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                    esp_restart();
+                }
+
+                // On-board with BLE token now that WiFi is connected
+                if (!TuyaProtocol::OnBoardWithToken(ble_result.token)) {
+                    ESP_LOGE(TAG, "On-boarding failed, restarting for re-provisioning");
+                    GetDisplay()->ShowNotification("激活失败，重启...", 3000);
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                    esp_restart();
+                }
+
+                // On-boarding succeeded — reboot for a clean start with NVS credentials
+                ESP_LOGI(TAG, "BLE pairing and on-boarding complete, rebooting...");
+                GetDisplay()->ShowNotification("配网成功，重启中...", 3000);
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                esp_restart();
             }
             // BLE timed out, show notification and retry
             GetDisplay()->ShowNotification("BLE配网超时，重试中...", 3000);

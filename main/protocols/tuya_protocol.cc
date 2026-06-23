@@ -159,12 +159,6 @@ bool TuyaProtocol::InitIotClient() {
         ESP_LOGW(TAG, "NVS credentials failed, trying on-boarding...");
     }
 
-    // Check if BLE token is available (first boot after BLE provisioning)
-    std::string ble_token = tuya_nvs.GetString("ble_token");
-    if (!ble_token.empty()) {
-        return OnBoardWithToken(ble_token);
-    }
-
     ESP_LOGE(TAG, "No credentials available - device not activated");
     return false;
 }
@@ -172,16 +166,19 @@ bool TuyaProtocol::InitIotClient() {
 bool TuyaProtocol::OnBoardWithToken(const std::string& token) {
     ESP_LOGI(TAG, "On-boarding with BLE token: %s", token.c_str());
 
+    EnsureSdkInitialized();
+
     iot_on_boarding_config_t cfg = {};
     memcpy((char*)cfg.uuid, TUYA_UUID, strlen(TUYA_UUID));
     memcpy((char*)cfg.authkey, TUYA_AUTH_KEY, strlen(TUYA_AUTH_KEY));
     memcpy((char*)cfg.product_key, TUYA_PRODUCT_KEY, strlen(TUYA_PRODUCT_KEY));
-    *(int*)&cfg.timeout_ms = 30000;
-    *(iot_env_t*)&cfg.env = PROD;
+    cfg.timeout_ms = 30000;
+    cfg.env = PROD;
     cfg.mqtt_disable_tls = false;
+    cfg.mqtt_auto_connect = true;
 
-    iot_client_ = iot_client_init_on_boarding_with_token(&cfg, token.c_str());
-    if (!iot_client_) {
+    iot_client_t* client = iot_client_init_on_boarding_with_token(&cfg, token.c_str());
+    if (!client) {
         ESP_LOGE(TAG, "On-boarding with BLE token failed");
         return false;
     }
@@ -189,13 +186,15 @@ bool TuyaProtocol::OnBoardWithToken(const std::string& token) {
     // Persist on-boarded credentials to NVS for subsequent boots
     {
         Settings settings("tuya", true);
-        settings.SetString("devid", iot_client_->devid);
-        settings.SetString("secret_key", iot_client_->secret_key);
-        settings.SetString("local_key", iot_client_->local_key);
-        settings.EraseKey("ble_token");  // Token is single-use
+        settings.SetString("devid", client->devid);
+        settings.SetString("secret_key", client->secret_key);
+        settings.SetString("local_key", client->local_key);
     }
 
-    ESP_LOGI(TAG, "On-boarded successfully, devid=%s", iot_client_->devid);
+    ESP_LOGI(TAG, "On-boarded successfully, devid=%s", client->devid);
+
+    // don't Free the client —  the mqtt is used by data point management
+    //iot_client_deinit(client);
     return true;
 }
 

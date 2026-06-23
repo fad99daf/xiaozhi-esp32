@@ -16,6 +16,13 @@ public:
     ~TuyaProtocol() override;
 
     bool Start() override;
+
+    // Activate device on Tuya cloud using BLE provisioning token.
+    // Requires WiFi to be connected. Saves credentials (devid, secret_key,
+    // local_key) to NVS so subsequent boots skip on-boarding.
+    // Returns true on success.
+    static bool OnBoardWithToken(const std::string& token);
+
     bool OpenAudioChannel() override;
     void CloseAudioChannel(bool send_goodbye = true) override;
     bool IsAudioChannelOpened() const override;
@@ -57,7 +64,6 @@ private:
     static const int MAX_CONNECT_FAILS_BEFORE_REFRESH = 2;
 
     bool InitIotClient();
-    bool OnBoardWithToken(const std::string& token);
     bool FetchToken();
     bool ParseToken();
     bool BuildTaiContext();
