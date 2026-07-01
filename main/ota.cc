@@ -22,6 +22,14 @@
 #include <sstream>
 #include <algorithm>
 
+#if CONFIG_PROTOCOL_TUYA
+extern "C" {
+#include "iot_client.h"
+#include "iot_ota.h"
+    extern const pal_t *tai_pal_freertos(void);
+}
+#endif
+
 #define TAG "Ota"
 
 
@@ -511,3 +519,111 @@ esp_err_t Ota::Activate() {
     ESP_LOGI(TAG, "Activation successful");
     return ESP_OK;
 }
+
+#if CONFIG_PROTOCOL_TUYA
+bool Ota::CheckTuyaVersion(std::function<void(int progress, size_t speed)> callback) {
+    // Initialize current_version_ from the running app description.
+    // This is the bug fix: in the Tuya path, CheckVersion() is never called,
+    // so current_version_ would otherwise be empty.
+    auto app_desc = esp_app_get_description();
+    current_version_ = app_desc->version;
+    ESP_LOGI(TAG, "Current version: %s", current_version_.c_str());
+
+    // Read Tuya credentials from NVS
+    Settings tuya_nvs("tuya", false);
+    std::string nvs_devid = tuya_nvs.GetString("devid");
+    if (nvs_devid.empty()) {
+        ESP_LOGI(TAG, "No Tuya credentials, skipping OTA check");
+        return false;
+    }
+
+    std::string nvs_secret = tuya_nvs.GetString("secret_key");
+    std::string nvs_local = tuya_nvs.GetString("local_key");
+
+    // Initialize SDK (idempotent)
+    static bool sdk_initialized = false;
+    if (!sdk_initialized) {
+        iot_init(tai_pal_freertos());
+        sdk_initialized = true;
+    }
+
+    // Create single iot_client for the entire OTA flow
+    iot_client_config_t cfg = {};
+    strncpy((char*)cfg.devid, nvs_devid.c_str(), sizeof(cfg.devid) - 1);
+    strncpy((char*)cfg.secret_key, nvs_secret.c_str(), sizeof(cfg.secret_key) - 1);
+    strncpy((char*)cfg.local_key, nvs_local.c_str(), sizeof(cfg.local_key) - 1);
+    cfg.region = AY;
+    cfg.env = PROD;
+    cfg.mqtt_disable_tls = false;
+
+    iot_client_t* client = iot_client_init(&cfg);
+    if (!client) {
+        ESP_LOGE(TAG, "Failed to create IoT client for OTA check");
+        return false;
+    }
+    ESP_LOGI(TAG, "IoT client created for OTA check (devid=%s)", nvs_devid.c_str());
+
+    // Report app-level firmware version (nice-to-have: improves cloud dashboard)
+    int rc = iot_ota_report_version(client, current_version_.c_str());
+    if (rc != OPRT_OK) {
+        ESP_LOGW(TAG, "iot_ota_report_version failed: %d (non-fatal)", rc);
+    }
+
+    // Check for upgrade
+    iot_ota_upgrade_info_t info = {0};
+    rc = iot_ota_check_upgrade(client, 0, current_version_.c_str(), &info);
+    if (rc != OPRT_OK) {
+        ESP_LOGE(TAG, "iot_ota_check_upgrade failed: %d", rc);
+        iot_client_deinit(client);
+        return false;
+    }
+
+    if (!info.has_upgrade) {
+        ESP_LOGI(TAG, "No firmware upgrade available");
+        iot_ota_upgrade_info_free(client, &info);
+        iot_client_deinit(client);
+        return false;
+    }
+
+    // Upgrade available — copy info before freeing
+    firmware_version_ = info.version ? info.version : "";
+    firmware_url_ = info.url ? info.url : "";
+    has_new_version_ = true;
+    ESP_LOGI(TAG, "Firmware upgrade available: %s -> %s",
+             current_version_.c_str(), firmware_version_.c_str());
+
+    // Free upgrade info (must be before iot_client_deinit — uses client->pal)
+    iot_ota_upgrade_info_free(client, &info);
+
+    // Report UPGRADING status
+    rc = iot_ota_report_status(client, 0, OTA_STATUS_UPGRADING);
+    if (rc != OPRT_OK) {
+        ESP_LOGW(TAG, "Failed to report UPGRADING status: %d (continuing)", rc);
+    }
+
+    // Download and flash firmware using the existing Ota::Upgrade()
+    bool success = Upgrade(firmware_url_, callback);
+
+    // Report final status
+    if (success) {
+        rc = iot_ota_report_status(client, 0, OTA_STATUS_UPGRAD_FINI);
+        if (rc != OPRT_OK) {
+            ESP_LOGW(TAG, "Failed to report FINI status: %d", rc);
+        }
+    } else {
+        rc = iot_ota_report_status(client, 0, OTA_STATUS_UPGRD_EXEC);
+        if (rc != OPRT_OK) {
+            ESP_LOGW(TAG, "Failed to report EXEC status: %d", rc);
+        }
+    }
+
+    iot_client_deinit(client);
+
+    if (success) {
+        ESP_LOGI(TAG, "Firmware upgrade successful, rebooting...");
+        return true;
+    }
+    ESP_LOGE(TAG, "Firmware upgrade failed");
+    return false;
+}
+#endif

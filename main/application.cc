@@ -399,6 +399,33 @@ void Application::CheckAssetsVersion() {
 void Application::CheckNewVersion() {
 #if CONFIG_PROTOCOL_TUYA
     ota_->MarkCurrentVersionValid();
+
+    auto& board = Board::GetInstance();
+    auto display = board.GetDisplay();
+    display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
+
+    // Check Tuya cloud for firmware upgrade. If an upgrade is available,
+    // CheckTuyaVersion() downloads and flashes it, reports status to the
+    // cloud, and returns true. The caller then reboots.
+    bool upgraded = ota_->CheckTuyaVersion([this, display, started = false](int progress, size_t speed) mutable {
+        if (!started) {
+            started = true;
+            Schedule([display]() {
+                display->SetStatus(Lang::Strings::UPGRADING);
+            });
+        }
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
+        Schedule([display, message = std::string(buffer)]() {
+            display->SetChatMessage("system", message.c_str());
+        });
+    });
+
+    if (upgraded) {
+        display->SetChatMessage("system", "Upgrade successful, rebooting...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        Reboot();
+    }
 #else
     const int MAX_RETRY = 10;
     int retry_count = 0;
