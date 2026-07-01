@@ -34,7 +34,7 @@ static const ble_uuid128_t s_read_chr_uuid = BLE_UUID128_INIT(
 
 static const ble_uuid16_t s_svc_uuid = BLE_UUID16_INIT(0xFD50);
 
-static tuya_ble_prov_state_t s_prov;
+static tuya_ble_prov_state_t *s_prov;
 static bool s_prov_done;
 static uint8_t s_own_addr_type;
 static uint16_t s_conn_handle;
@@ -118,7 +118,7 @@ static int prov_gatt_write_access(uint16_t conn_handle, uint16_t attr_handle,
 
     uint8_t raw[TUYA_BLE_RX_BUF_SIZE];
     os_mbuf_copydata(ctxt->om, 0, len, raw);
-    tuya_ble_prov_on_data(&s_prov, raw, len);
+    tuya_ble_prov_on_data(s_prov, raw, len);
     return 0;
 }
 
@@ -143,7 +143,7 @@ static int prov_gatt_read_access(uint16_t conn_handle, uint16_t attr_handle,
     const uint8_t *rsp_data;
     uint8_t adv_len;
     uint8_t rsp_len;
-    tuya_ble_prov_get_read_payload(&s_prov, &adv_data, &adv_len, &rsp_data, &rsp_len);
+    tuya_ble_prov_get_read_payload(s_prov, &adv_data, &adv_len, &rsp_data, &rsp_len);
 
     ESP_LOGI(TAG, "[GATT] Read characteristic, returning adv+rsp (%d+%d bytes)", adv_len, rsp_len);
 
@@ -160,7 +160,7 @@ static void prov_start_advertise(void)
     const uint8_t *rsp_data;
     uint8_t adv_len;
     uint8_t rsp_len;
-    tuya_ble_prov_get_adv_data(&s_prov, &adv_data, &adv_len, &rsp_data, &rsp_len);
+    tuya_ble_prov_get_adv_data(s_prov, &adv_data, &adv_len, &rsp_data, &rsp_len);
 
     ble_gap_adv_set_data(adv_data, adv_len);
     ble_gap_adv_rsp_set_data(rsp_data, rsp_len);
@@ -188,7 +188,7 @@ static int prov_gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
-            tuya_ble_prov_reset_conn(&s_prov);
+            tuya_ble_prov_reset_conn(s_prov);
             ble_gap_conn_find(s_conn_handle, &desc);
             ESP_LOGI(TAG, "[GAP] CONNECT, handle=%d, peer=%02x:%02x:%02x:%02x:%02x:%02x",
                      s_conn_handle,
@@ -207,7 +207,7 @@ static int prov_gap_event(struct ble_gap_event *event, void *arg)
         ESP_LOGW(TAG, "[GAP] DISCONNECT, reason=0x%x", event->disconnect.reason);
         s_conn_handle = 0;
         s_notify_enabled = false;
-        tuya_ble_prov_set_paired(&s_prov, false);
+        tuya_ble_prov_set_paired(s_prov, false);
         if (!s_prov_done) {
             prov_start_advertise();
         }
@@ -298,6 +298,12 @@ int tuya_ble_nimble_start(const tuya_ble_prov_cfg_t *cfg)
     s_conn_handle = 0;
     s_notify_enabled = false;
 
+    s_prov = calloc(1, sizeof(tuya_ble_prov_state_t));
+    if (s_prov == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate s_prov (%zu bytes)", sizeof(tuya_ble_prov_state_t));
+        return -1;
+    }
+
     tuya_ble_prov_cfg_ext_t prov_cfg = {
         .device_name = cfg->device_name,
         .product_key = cfg->product_key,
@@ -308,7 +314,9 @@ int tuya_ble_nimble_start(const tuya_ble_prov_cfg_t *cfg)
         .send_ctx = NULL,
     };
 
-    if (tuya_ble_prov_init(&s_prov, &prov_cfg) != 0) {
+    if (tuya_ble_prov_init(s_prov, &prov_cfg) != 0) {
+        free(s_prov);
+        s_prov = NULL;
         return -1;
     }
 
@@ -355,6 +363,8 @@ int tuya_ble_nimble_stop(void)
     if (rc == 0) {
         nimble_port_deinit();
     }
+    free(s_prov);
+    s_prov = NULL;
     ESP_LOGI(TAG, "BLE provisioning stopped");
     return 0;
 }

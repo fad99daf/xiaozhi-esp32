@@ -388,7 +388,7 @@ void AudioService::OpusCodecTask() {
             if (opus_decoder_ != nullptr) {
                 task->pcm.resize(decoder_frame_size_);
                 esp_audio_dec_in_raw_t raw = {
-                    .buffer = (uint8_t *)(packet->payload.data()),
+                    .buffer = packet->payload.data(),
                     .len = (uint32_t)(packet->payload.size()),
                     .consumed = 0,
                     .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
@@ -577,7 +577,13 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
             return false;
         }
     }
-    audio_decode_queue_.push_back(std::move(packet));
+    // Convert to PSRAM-backed decode packet
+    auto dpkt = std::make_unique<DecodeAudioPacket>();
+    dpkt->sample_rate = packet->sample_rate;
+    dpkt->frame_duration = packet->frame_duration;
+    dpkt->timestamp = packet->timestamp;
+    dpkt->payload.assign(packet->payload.begin(), packet->payload.end());
+    audio_decode_queue_.push_back(std::move(dpkt));
     audio_queue_cv_.notify_all();
     return true;
 }
@@ -674,9 +680,18 @@ void AudioService::EnableAudioTesting(bool enable) {
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING);
     } else {
         xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING);
-        /* Copy audio_testing_queue_ to audio_decode_queue_ */
+        /* Move audio_testing_queue_ to audio_decode_queue_ (converting to PSRAM-backed packets) */
         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-        audio_decode_queue_ = std::move(audio_testing_queue_);
+        while (!audio_testing_queue_.empty()) {
+            auto& src = audio_testing_queue_.front();
+            auto dpkt = std::make_unique<DecodeAudioPacket>();
+            dpkt->sample_rate = src->sample_rate;
+            dpkt->frame_duration = src->frame_duration;
+            dpkt->timestamp = src->timestamp;
+            dpkt->payload.assign(src->payload.begin(), src->payload.end());
+            audio_decode_queue_.push_back(std::move(dpkt));
+            audio_testing_queue_.pop_front();
+        }
         audio_queue_cv_.notify_all();
     }
 }

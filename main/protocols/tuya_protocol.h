@@ -69,14 +69,14 @@ private:
     bool BuildTaiContext();
     bool RefreshTaiContext();
 
-    static void OnAudioCb(tai_ctx_t* ctx, const uint8_t* data, size_t len,
-                          uint32_t sample_rate, uint16_t frame_duration,
+    static void OnAudioCb(tai_ctx_t* ctx, const tai_audio_msg_t* msg,
                           void* user);
-    static void OnTextCb(tai_ctx_t* ctx, const char* text, size_t len,
-                         uint8_t stream_flag, void* user);
-    static void OnEventCb(tai_ctx_t* ctx, uint16_t event_type,
-                          const uint8_t* data, size_t len, void* user);
-    static void OnDisconnectCb(tai_ctx_t* ctx, uint16_t error_code, void* user);
+    static void OnTextCb(tai_ctx_t* ctx, const tai_text_msg_t* msg,
+                         void* user);
+    static void OnEventCb(tai_ctx_t* ctx, const tai_event_msg_t* msg,
+                          void* user);
+    static void OnDisconnectCb(tai_ctx_t* ctx, const tai_disconnect_msg_t* msg,
+                               void* user);
 
     void HandleAudio(const uint8_t* data, size_t len,
                      uint32_t sample_rate, uint16_t frame_duration);

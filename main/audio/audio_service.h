@@ -11,6 +11,7 @@
 #include <freertos/task.h>
 #include <freertos/event_groups.h>
 #include <esp_timer.h>
+#include <esp_heap_caps.h>
 #include <model_path.h>
 #include "esp_audio_enc.h"
 #include "esp_opus_enc.h"
@@ -40,7 +41,7 @@
 #define OPUS_MAX_FRAME_DURATION_MS 120
 #define MAX_ENCODE_TASKS_IN_QUEUE 2
 #define MAX_PLAYBACK_TASKS_IN_QUEUE 2
-#define MAX_DECODE_PACKETS_IN_QUEUE (24000 / OPUS_FRAME_DURATION_MS)
+#define MAX_DECODE_PACKETS_IN_QUEUE (48000 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
 #define MAX_TIMESTAMPS_IN_QUEUE 3
@@ -94,6 +95,49 @@ struct AudioTask {
     AudioTaskType type;
     std::vector<int16_t> pcm;
     uint32_t timestamp;
+};
+
+// Allocator that places allocations in PSRAM, falling back to internal RAM.
+template <typename T>
+struct PsramAllocator {
+    using value_type = T;
+    PsramAllocator() noexcept = default;
+    template <typename U>
+    PsramAllocator(const PsramAllocator<U>&) noexcept {}
+
+    T* allocate(std::size_t n) {
+        void* p = heap_caps_malloc(n * sizeof(T), MALLOC_CAP_SPIRAM);
+        if (!p) p = heap_caps_malloc(n * sizeof(T), MALLOC_CAP_DEFAULT);
+        if (!p) throw std::bad_alloc();
+        return static_cast<T*>(p);
+    }
+    void deallocate(T* p, std::size_t) noexcept {
+        heap_caps_free(p);
+    }
+};
+
+template <typename T, typename U>
+bool operator==(const PsramAllocator<T>&, const PsramAllocator<U>&) noexcept { return true; }
+template <typename T, typename U>
+bool operator!=(const PsramAllocator<T>&, const PsramAllocator<U>&) noexcept { return false; }
+
+// Decode-queue packet whose payload buffer lives in PSRAM.
+// The struct itself is also PSRAM-allocated via operator new.
+struct DecodeAudioPacket {
+    int sample_rate = 0;
+    int frame_duration = 0;
+    uint32_t timestamp = 0;
+    std::vector<uint8_t, PsramAllocator<uint8_t>> payload;
+
+    static void* operator new(size_t size) {
+        void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+        if (!p) p = heap_caps_malloc(size, MALLOC_CAP_DEFAULT);
+        if (!p) throw std::bad_alloc();
+        return p;
+    }
+    static void operator delete(void* ptr) {
+        heap_caps_free(ptr);
+    }
 };
 
 struct DebugStatistics {
@@ -169,7 +213,7 @@ private:
     TaskHandle_t opus_codec_task_handle_ = nullptr;
     std::mutex audio_queue_mutex_;
     std::condition_variable audio_queue_cv_;
-    std::deque<std::unique_ptr<AudioStreamPacket>> audio_decode_queue_;
+    std::deque<std::unique_ptr<DecodeAudioPacket>> audio_decode_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_send_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_testing_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_;

@@ -345,7 +345,7 @@ bool TuyaProtocol::BuildTaiContext() {
     /* Enable agentic-kit debug logging (level 4 = DEBUG).
      * This logs t_send(), t_recv() entries, packet dispatch, etc.
      * at the agentic-kit layer using the project-wide log facade. */
-    tai_set_log_level(4);
+    tai_set_log_level(2);
 
     return true;
 }
@@ -488,7 +488,7 @@ bool TuyaProtocol::IsAudioChannelOpened() const {
 }
 
 void TuyaProtocol::SendStartListening(ListeningMode mode) {
-    ESP_LOGI(TAG, "[BARGE-IN] SendStartListening: mode=%d, is_first=%d", mode, (int)is_first_audio_packet_);
+    //ESP_LOGI(TAG, "[BARGE-IN] SendStartListening: mode=%d, is_first=%d", mode, (int)is_first_audio_packet_);
     if (!ctx_ || !session_active_) {
         ESP_LOGW(TAG, "SendStartListening: not ready");
         return;
@@ -518,9 +518,9 @@ bool TuyaProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
     if (seq % 100 == 0) {
         int64_t now = esp_timer_get_time() / 1000;  // ms
         if (first_ts == 0) first_ts = now;
-        float rate = (now - first_ts) > 0 ? (seq + 1) * 1000.0f / (now - first_ts) : 0;
-        ESP_LOGI(TAG, "[BARGE-IN] Audio send #%lu: %d bytes @ %.1f pkt/s (elapsed=%lld ms)",
-                 (unsigned long)seq, (int)packet->payload.size(), rate, now - first_ts);
+        //float rate = (now - first_ts) > 0 ? (seq + 1) * 1000.0f / (now - first_ts) : 0;
+        //ESP_LOGI(TAG, "[BARGE-IN] Audio send #%lu: %d bytes @ %.1f pkt/s (elapsed=%lld ms)",
+        //         (unsigned long)seq, (int)packet->payload.size(), rate, now - first_ts);
     }
 
     std::lock_guard<std::mutex> lock(send_mutex_);
@@ -561,37 +561,38 @@ bool TuyaProtocol::SendText(const std::string& text) {
 
 // --- SDK callbacks ---
 
-void TuyaProtocol::OnAudioCb(tai_ctx_t* ctx, const uint8_t* data,
-                              size_t len, uint32_t sample_rate,
-                              uint16_t frame_duration, void* user) {
+void TuyaProtocol::OnAudioCb(tai_ctx_t* ctx, const tai_audio_msg_t* msg,
+                              void* user) {
     auto self = static_cast<TuyaProtocol*>(user);
-    self->HandleAudio(data, len, sample_rate, frame_duration);
+    self->HandleAudio(msg->data, msg->len, msg->sample_rate,
+                      msg->frame_duration);
 }
 
-void TuyaProtocol::OnTextCb(tai_ctx_t* ctx, const char* text, size_t len,
-                             uint8_t stream_flag, void* user) {
+void TuyaProtocol::OnTextCb(tai_ctx_t* ctx, const tai_text_msg_t* msg,
+                             void* user) {
     auto self = static_cast<TuyaProtocol*>(user);
-    self->HandleText(text, len, stream_flag);
+    self->HandleText(msg->text, msg->len, msg->stream_flag);
 }
 
-void TuyaProtocol::OnEventCb(tai_ctx_t* ctx, uint16_t event_type,
-                              const uint8_t* data, size_t len, void* user) {
+void TuyaProtocol::OnEventCb(tai_ctx_t* ctx, const tai_event_msg_t* msg,
+                              void* user) {
     auto self = static_cast<TuyaProtocol*>(user);
-    self->HandleEvent(event_type, data, len);
+    self->HandleEvent(msg->event_type, msg->data, msg->len);
 }
 
-void TuyaProtocol::OnDisconnectCb(tai_ctx_t* ctx, uint16_t error_code,
+void TuyaProtocol::OnDisconnectCb(tai_ctx_t* ctx,
+                                   const tai_disconnect_msg_t* msg,
                                    void* user) {
     auto self = static_cast<TuyaProtocol*>(user);
-    self->HandleDisconnect(error_code);
+    self->HandleDisconnect(msg->close_code);
 }
 
 void TuyaProtocol::HandleAudio(const uint8_t* data, size_t len,
                                 uint32_t sample_rate, uint16_t frame_duration) {
     audio_recv_count_++;
     if (audio_recv_count_ % 50 == 1) {
-        ESP_LOGI(TAG, "[BARGE-IN] HandleAudio #%d: len=%d, sr=%u, fd=%u",
-                 audio_recv_count_, (int)len, sample_rate, frame_duration);
+        //ESP_LOGI(TAG, "[BARGE-IN] HandleAudio #%d: len=%d, sr=%u, fd=%u",
+        //         audio_recv_count_, (int)len, sample_rate, frame_duration);
     }
     if (!on_incoming_audio_ || len == 0) return;
 
@@ -629,8 +630,8 @@ void TuyaProtocol::HandleAudio(const uint8_t* data, size_t len,
 }
 
 void TuyaProtocol::HandleText(const char* text, size_t len, uint8_t stream_flag) {
-    ESP_LOGI(TAG, "HandleText: flag=%d len=%d text=%.*s", stream_flag, (int)len,
-             (int)(len > 200 ? 200 : len), text);
+    //ESP_LOGI(TAG, "HandleText: flag=%d len=%d text=%.*s", stream_flag, (int)len,
+    //         (int)(len > 200 ? 200 : len), text);
     if (!on_incoming_json_) return;
     std::string raw(text, len);
 
@@ -686,7 +687,7 @@ void TuyaProtocol::HandleText(const char* text, size_t len, uint8_t stream_flag)
 
 void TuyaProtocol::HandleEvent(uint16_t event_type,
                                 const uint8_t* data, size_t len) {
-    ESP_LOGI(TAG, "HandleEvent: type=%u len=%d", event_type, (int)len);
+    //ESP_LOGI(TAG, "HandleEvent: type=%u len=%d", event_type, (int)len);
 
     if (event_type == TAI_EVT_SERVER_VAD) {
         ESP_LOGW(TAG, "[BARGE-IN] Server VAD detected end of speech (is_first=%d)", (int)is_first_audio_packet_);
