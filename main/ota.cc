@@ -26,6 +26,7 @@
 extern "C" {
 #include "iot_client.h"
 #include "iot_ota.h"
+#include "esp_crt_bundle.h"
     extern const pal_t *tai_pal_freertos(void);
 }
 #endif
@@ -555,6 +556,8 @@ bool Ota::CheckTuyaVersion(std::function<void(int progress, size_t speed)> callb
     cfg.region = AY;
     cfg.env = PROD;
     cfg.mqtt_disable_tls = false;
+    cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
+    cfg.sw_ver = current_version_.c_str();
 
     iot_client_t* client = iot_client_init(&cfg);
     if (!client) {
@@ -563,15 +566,9 @@ bool Ota::CheckTuyaVersion(std::function<void(int progress, size_t speed)> callb
     }
     ESP_LOGI(TAG, "IoT client created for OTA check (devid=%s)", nvs_devid.c_str());
 
-    // Report app-level firmware version (nice-to-have: improves cloud dashboard)
-    int rc = iot_ota_report_version(client, current_version_.c_str());
-    if (rc != OPRT_OK) {
-        ESP_LOGW(TAG, "iot_ota_report_version failed: %d (non-fatal)", rc);
-    }
-
     // Check for upgrade
     iot_ota_upgrade_info_t info = {0};
-    rc = iot_ota_check_upgrade(client, 0, current_version_.c_str(), &info);
+    int rc = iot_ota_check_upgrade(client, 0, current_version_.c_str(), &info);
     if (rc != OPRT_OK) {
         ESP_LOGE(TAG, "iot_ota_check_upgrade failed: %d", rc);
         iot_client_deinit(client);

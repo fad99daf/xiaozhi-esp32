@@ -1061,14 +1061,9 @@ idf_component_register(SRCS ${SOURCES}
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 
-# Override TAI buffer sizes for ESP32 RAM constraints (upstream defaults are 64-128KB each)
-idf_component_get_property(agentic_kit_lib esp-agentic-kit COMPONENT_LIB)
-target_compile_definitions(${agentic_kit_lib} PRIVATE
-    TAI_RX_BUF_SIZE=16384
-    TAI_FRAG_BUF_SIZE=32768
-    TAI_TX_APP_BUF_SIZE=16384
-    TAI_TX_FRAME_BUF_SIZE=16448
-)
+# TAI buffer sizes: upstream defaults (~37 KB total context) are ESP32-friendly;
+# no overrides needed. Previous overrides referenced symbols removed by the
+# scatter-gather TX redesign and conflicted with non-guarded #define guards.
 
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
 # If BOARD_NAME is empty, use BOARD_TYPE

@@ -7,6 +7,8 @@
 #include <esp_timer.h>
 #include <esp_heap_caps.h>
 #include <esp_memory_utils.h>
+#include <esp_crt_bundle.h>
+#include <esp_app_desc.h>
 #include <cJSON.h>
 #include <mbedtls/base64.h>
 
@@ -150,6 +152,8 @@ bool TuyaProtocol::InitIotClient() {
         cfg.region = AY;
         cfg.env = PROD;
         cfg.mqtt_disable_tls = false;
+        cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
+        cfg.sw_ver = esp_app_get_description()->version;
 
         iot_client_ = iot_client_init(&cfg);
         if (iot_client_) {
@@ -176,6 +180,8 @@ bool TuyaProtocol::OnBoardWithToken(const std::string& token) {
     cfg.env = PROD;
     cfg.mqtt_disable_tls = false;
     cfg.mqtt_auto_connect = true;
+    cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
+    cfg.sw_ver = esp_app_get_description()->version;
 
     iot_client_t* client = iot_client_init_on_boarding_with_token(&cfg, token.c_str());
     if (!client) {
@@ -290,10 +296,9 @@ bool TuyaProtocol::ParseToken() {
 
 bool TuyaProtocol::BuildTaiContext() {
     size_t sz = tai_ctx_size();
-    // Allocate the 80 KB TAI context in PSRAM rather than internal RAM.
-    // The TAI PAL accesses this memory only from regular FreeRTOS tasks
-    // (no ISR / cache-disabled paths), so PSRAM is safe and saves ~80 KB
-    // of internal DRAM.
+    // Allocate the TAI context in PSRAM rather than internal RAM.
+    // The context size is printed below; after the scatter-gather redesign
+    // it is ~37 KB. PSRAM is safe (no ISR/cache-disabled access).
     ctx_mem_ = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!ctx_mem_) {
         ESP_LOGE(TAG, "Failed to allocate %u bytes for TAI context in PSRAM", (unsigned)sz);
@@ -312,6 +317,7 @@ bool TuyaProtocol::BuildTaiContext() {
     cfg.biz_tag = (uint64_t)conn_params_.biz_tag;
     cfg.sign_level = TAI_SIGN_HMAC_SHA256;
     cfg.agent_token = conn_params_.agent_token;
+    cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
     cfg.pal = tai_pal_freertos();
 
     cfg.session_attrs_json =
@@ -584,7 +590,8 @@ void TuyaProtocol::OnDisconnectCb(tai_ctx_t* ctx,
                                    const tai_disconnect_msg_t* msg,
                                    void* user) {
     auto self = static_cast<TuyaProtocol*>(user);
-    self->HandleDisconnect(msg->close_code);
+    self->HandleDisconnect(msg->reason, msg->detail, msg->close_code,
+                           msg->connection_alive);
 }
 
 void TuyaProtocol::HandleAudio(const uint8_t* data, size_t len,
@@ -732,10 +739,56 @@ void TuyaProtocol::HandleEvent(uint16_t event_type,
     }
 }
 
-void TuyaProtocol::HandleDisconnect(uint16_t error_code) {
+static const char* disconnect_reason_name(uint8_t reason) {
+    switch (reason) {
+        case TAI_DISCONNECT_SESSION_CLOSE:    return "SESSION_CLOSE";
+        case TAI_DISCONNECT_CONNECTION_CLOSE: return "CONNECTION_CLOSE";
+        case TAI_DISCONNECT_TRANSPORT:         return "TRANSPORT";
+        case TAI_DISCONNECT_PROTOCOL:          return "PROTOCOL";
+        default:                               return "?";
+    }
+}
+
+static const char* disconnect_detail_name(uint8_t reason, uint8_t detail) {
+    if (reason == TAI_DISCONNECT_TRANSPORT) {
+        switch (detail) {
+            case TAI_TRANSPORT_PING_TIMEOUT: return "PING_TIMEOUT";
+            case TAI_TRANSPORT_EOF:          return "EOF";
+            case TAI_TRANSPORT_NET_ERROR:    return "NET_ERROR";
+            default:                         return "?";
+        }
+    }
+    if (reason == TAI_DISCONNECT_PROTOCOL) {
+        switch (detail) {
+            case TAI_PROTO_ERR_BAD_VERSION: return "BAD_VERSION";
+            case TAI_PROTO_ERR_HMAC:        return "HMAC";
+            case TAI_PROTO_ERR_FRAME_DECODE:return "FRAME_DECODE";
+            case TAI_PROTO_ERR_FRAG:        return "FRAG";
+            case TAI_PROTO_ERR_PKT_DECODE:  return "PKT_DECODE";
+            case TAI_PROTO_ERR_UNKNOWN_PKT: return "UNKNOWN_PKT";
+            case TAI_PROTO_ERR_EVENT:       return "EVENT";
+            case TAI_PROTO_ERR_MEDIA_HDR:   return "MEDIA_HDR";
+            case TAI_PROTO_ERR_UNEXPECTED:  return "UNEXPECTED";
+            case TAI_PROTO_ERR_OVERSIZED:   return "OVERSIZED";
+            default:                        return "?";
+        }
+    }
+    return "-";
+}
+
+void TuyaProtocol::HandleDisconnect(uint8_t reason, uint8_t detail,
+                                     uint16_t close_code, uint8_t connection_alive) {
     connected_ = false;
     session_active_ = false;
-    ESP_LOGW(TAG, "Disconnected (code=%u)", error_code);
+    if (connection_alive) {
+        ESP_LOGI(TAG, "Disconnected (reason=%s detail=%s close_code=%u connection_alive=%d)",
+                 disconnect_reason_name(reason), disconnect_detail_name(reason, detail),
+                 close_code, connection_alive);
+    } else {
+        ESP_LOGW(TAG, "Disconnected (reason=%s detail=%s close_code=%u connection_alive=%d)",
+                 disconnect_reason_name(reason), disconnect_detail_name(reason, detail),
+                 close_code, connection_alive);
+    }
     if (on_network_error_) {
         on_network_error_("Tuya AI connection lost");
     }

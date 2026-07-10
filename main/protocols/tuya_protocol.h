@@ -82,7 +82,8 @@ private:
                      uint32_t sample_rate, uint16_t frame_duration);
     void HandleText(const char* text, size_t len, uint8_t stream_flag);
     void HandleEvent(uint16_t event_type, const uint8_t* data, size_t len);
-    void HandleDisconnect(uint16_t error_code);
+    void HandleDisconnect(uint8_t reason, uint8_t detail,
+                          uint16_t close_code, uint8_t connection_alive);
 
     bool SendText(const std::string& text) override;
 };
