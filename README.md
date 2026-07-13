@@ -41,6 +41,15 @@
 
 ## 配置和编译
 
+### 0. 更新子模块
+
+tuya协议相关功能通过`components/esp-agentic-kit` git子模块引入, 需先更新子模块。
+
+```
+git submodule update --init --recursive 
+```
+
+
 ### 1. 配置授权码信息
 
 在项目根目录创建 `tuya_authkey.txt` 文件, 填入你的产品 PID 和授权码:
@@ -58,6 +67,7 @@ TUYA_PRODUCT_KEY=your_product_pid_here
 ### 2. menuconfig 配置
 
 ```sh
+idf.py set-target esp32s3    # 根据你的开发板选择目标芯片
 idf.py menuconfig
 ```
 
@@ -76,7 +86,6 @@ idf.py menuconfig
 ### 3. 编译和烧录
 
 ```sh
-idf.py set-target esp32s3    # 根据你的开发板选择目标芯片
 idf.py build
 idf.py flash monitor
 ```
