@@ -568,7 +568,7 @@ bool Ota::CheckTuyaVersion(std::function<void(int progress, size_t speed)> callb
 
     // Check for upgrade
     iot_ota_upgrade_info_t info = {0};
-    int rc = iot_ota_check_upgrade(client, 0, current_version_.c_str(), &info);
+    int rc = iot_ota_check_upgrade(client, 0, &info);
     if (rc != OPRT_OK) {
         ESP_LOGE(TAG, "iot_ota_check_upgrade failed: %d", rc);
         iot_client_deinit(client);
