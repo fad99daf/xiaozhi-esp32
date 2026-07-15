@@ -149,8 +149,8 @@ bool TuyaProtocol::InitIotClient() {
         strncpy((char*)cfg.devid, nvs_devid.c_str(), sizeof(cfg.devid) - 1);
         strncpy((char*)cfg.secret_key, nvs_secret.c_str(), sizeof(cfg.secret_key) - 1);
         strncpy((char*)cfg.local_key, nvs_local.c_str(), sizeof(cfg.local_key) - 1);
-        cfg.region = AY;
-        cfg.env = PROD;
+        cfg.region = (iot_region_t)tuya_nvs.GetInt("region", (int32_t)AY);
+        cfg.env = (iot_env_t)tuya_nvs.GetInt("env", (int32_t)PROD);
         cfg.mqtt_disable_tls = false;
         cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
         cfg.sw_ver = esp_app_get_description()->version;
@@ -195,6 +195,8 @@ bool TuyaProtocol::OnBoardWithToken(const std::string& token) {
         settings.SetString("devid", client->devid);
         settings.SetString("secret_key", client->secret_key);
         settings.SetString("local_key", client->local_key);
+        settings.SetInt("region", (int32_t)client->region);
+        settings.SetInt("env", (int32_t)client->env);
     }
 
     ESP_LOGI(TAG, "On-boarded successfully, devid=%s", client->devid);
