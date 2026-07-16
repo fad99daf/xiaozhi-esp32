@@ -214,14 +214,19 @@ private:
     bool user_only_ = false;
 
 public:
-    McpTool(const std::string& name, 
-            const std::string& description, 
-            const PropertyList& properties, 
+    McpTool(const std::string& name,
+            const std::string& description,
+            const PropertyList& properties,
             std::function<ReturnValue(const PropertyList&)> callback)
-        : name_(name), 
-        description_(description), 
-        properties_(properties), 
-        callback_(callback) {}
+        : description_(description),
+        properties_(properties),
+        callback_(callback) {
+        // Sanitize tool name: replace dots with underscores for LLM function name compatibility
+        name_.reserve(name.size());
+        for (char c : name) {
+            name_.push_back(c == '.' ? '_' : c);
+        }
+    }
 
     void set_user_only(bool user_only) { user_only_ = user_only; }
     inline const std::string& name() const { return name_; }

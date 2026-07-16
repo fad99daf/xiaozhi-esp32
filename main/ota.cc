@@ -553,7 +553,7 @@ bool Ota::CheckTuyaVersion(std::function<void(int progress, size_t speed)> callb
     strncpy((char*)cfg.devid, nvs_devid.c_str(), sizeof(cfg.devid) - 1);
     strncpy((char*)cfg.secret_key, nvs_secret.c_str(), sizeof(cfg.secret_key) - 1);
     strncpy((char*)cfg.local_key, nvs_local.c_str(), sizeof(cfg.local_key) - 1);
-    cfg.region = AY;
+    cfg.region = (iot_region_t)tuya_nvs.GetInt("region", (int32_t)AY);
     cfg.env = PROD;
     cfg.mqtt_disable_tls = false;
     cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;

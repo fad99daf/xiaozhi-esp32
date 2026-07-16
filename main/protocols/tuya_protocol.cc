@@ -152,6 +152,7 @@ bool TuyaProtocol::InitIotClient() {
         cfg.region = (iot_region_t)tuya_nvs.GetInt("region", (int32_t)AY);
         cfg.env = (iot_env_t)tuya_nvs.GetInt("env", (int32_t)PROD);
         cfg.mqtt_disable_tls = false;
+        cfg.mqtt_auto_connect = true;
         cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
         cfg.sw_ver = esp_app_get_description()->version;
 
@@ -353,7 +354,7 @@ bool TuyaProtocol::BuildTaiContext() {
     /* Enable agentic-kit debug logging (level 4 = DEBUG).
      * This logs t_send(), t_recv() entries, packet dispatch, etc.
      * at the agentic-kit layer using the project-wide log facade. */
-    tai_set_log_level(2);
+    tai_set_log_level(4);
 
     return true;
 }
@@ -376,8 +377,8 @@ bool TuyaProtocol::RefreshTaiContext() {
     local_key_ = iot_client_->local_key;
     if (!FetchToken()) return false;
 
-    iot_client_deinit(iot_client_);
-    iot_client_ = nullptr;
+    // iot_client_deinit(iot_client_);
+    // iot_client_ = nullptr;
 
     if (!ParseToken()) return false;
     if (!BuildTaiContext()) return false;
@@ -419,8 +420,8 @@ bool TuyaProtocol::Start() {
     // channel uses its own TLS connection.
     before_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     before_ps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    iot_client_deinit(iot_client_);
-    iot_client_ = nullptr;
+    //iot_client_deinit(iot_client_);
+    //iot_client_ = nullptr;
     log_heap_delta("iot_client_deinit (freed)", before_int, before_ps);
 
     if (!ParseToken()) return false;
@@ -600,8 +601,8 @@ void TuyaProtocol::HandleAudio(const uint8_t* data, size_t len,
                                 uint32_t sample_rate, uint16_t frame_duration) {
     audio_recv_count_++;
     if (audio_recv_count_ % 50 == 1) {
-        //ESP_LOGI(TAG, "[BARGE-IN] HandleAudio #%d: len=%d, sr=%u, fd=%u",
-        //         audio_recv_count_, (int)len, sample_rate, frame_duration);
+        ESP_LOGI(TAG, "HandleAudio #%d: len=%d, sr=%u, fd=%u",
+                 audio_recv_count_, (int)len, sample_rate, frame_duration);
     }
     if (!on_incoming_audio_ || len == 0) return;
 
@@ -673,16 +674,16 @@ void TuyaProtocol::HandleText(const char* text, size_t len, uint8_t stream_flag)
             cJSON_Delete(out);
         }
     } else if (strcmp(bizType->valuestring, "NLG") == 0) {
-        if (!has_received_first_nlg_) {
-            cJSON* start = cJSON_CreateObject();
-            cJSON_AddStringToObject(start, "type", "tts");
-            cJSON_AddStringToObject(start, "state", "start");
-            on_incoming_json_(start);
-            cJSON_Delete(start);
-            has_received_first_nlg_ = true;
-        }
         cJSON* content = cJSON_GetObjectItem(dataObj, "content");
         if (cJSON_IsString(content) && strlen(content->valuestring) > 0) {
+            if (!has_received_first_nlg_) {
+                cJSON* start = cJSON_CreateObject();
+                cJSON_AddStringToObject(start, "type", "tts");
+                cJSON_AddStringToObject(start, "state", "start");
+                on_incoming_json_(start);
+                cJSON_Delete(start);
+                has_received_first_nlg_ = true;
+            }
             cJSON* out = cJSON_CreateObject();
             cJSON_AddStringToObject(out, "type", "tts");
             cJSON_AddStringToObject(out, "state", "sentence_start");
