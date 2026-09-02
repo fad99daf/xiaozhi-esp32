@@ -603,14 +603,14 @@ bool Ota::CheckTuyaVersion(std::function<void(int progress, size_t speed)> callb
 
     // Report final status
     if (success) {
-        rc = iot_ota_report_status(client, 0, OTA_STATUS_UPGRAD_FINI);
+        rc = iot_ota_report_status(client, 0, OTA_STATUS_COMPLETE);
         if (rc != OPRT_OK) {
-            ESP_LOGW(TAG, "Failed to report FINI status: %d", rc);
+            ESP_LOGW(TAG, "Failed to report complete status: %d", rc);
         }
     } else {
-        rc = iot_ota_report_status(client, 0, OTA_STATUS_UPGRD_EXEC);
+        rc = iot_ota_report_status(client, 0, OTA_STATUS_ERROR);
         if (rc != OPRT_OK) {
-            ESP_LOGW(TAG, "Failed to report EXEC status: %d", rc);
+            ESP_LOGW(TAG, "Failed to report error status: %d", rc);
         }
     }
 

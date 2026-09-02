@@ -152,7 +152,6 @@ bool TuyaProtocol::InitIotClient() {
         cfg.region = (iot_region_t)tuya_nvs.GetInt("region", (int32_t)AY);
         cfg.env = (iot_env_t)tuya_nvs.GetInt("env", (int32_t)PROD);
         cfg.mqtt_disable_tls = false;
-        cfg.mqtt_auto_connect = true;
         cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
         cfg.sw_ver = esp_app_get_description()->version;
 
@@ -180,7 +179,6 @@ bool TuyaProtocol::OnBoardWithToken(const std::string& token) {
     cfg.timeout_ms = 30000;
     cfg.env = PROD;
     cfg.mqtt_disable_tls = false;
-    cfg.mqtt_auto_connect = true;
     cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
     cfg.sw_ver = esp_app_get_description()->version;
 
