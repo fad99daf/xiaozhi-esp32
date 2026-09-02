@@ -775,6 +775,7 @@ void AudioService::AbortOutput() {
     // Stop audio output immediately: clear all queues and signal the
     // worker tasks to drop any frames that were already popped before
     // the clear.  Called from Application::AbortSpeaking / CHAT_BREAK handler.
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     ESP_LOGW(TAG, "AbortOutput: clearing %d decode + %d playback packets",
              (int)audio_decode_queue_.size(), (int)audio_playback_queue_.size());
     output_aborted_ = true;
