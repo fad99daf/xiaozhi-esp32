@@ -9,6 +9,7 @@
 #include <esp_memory_utils.h>
 #include <esp_crt_bundle.h>
 #include <esp_app_desc.h>
+#include <esp_wifi.h>
 #include <cJSON.h>
 #include <mbedtls/base64.h>
 
@@ -136,6 +137,13 @@ TuyaProtocol::~TuyaProtocol() {
 
 bool TuyaProtocol::InitIotClient() {
     EnsureSdkInitialized();
+
+    if (iot_client_) {
+        // A previous client may still be alive (e.g. after a context refresh).
+        // Deinit it first so the MQTT TLS buffers and worker threads don't leak.
+        iot_client_deinit(iot_client_);
+        iot_client_ = nullptr;
+    }
 
     Settings tuya_nvs("tuya", false);
     std::string nvs_devid = tuya_nvs.GetString("devid");
@@ -309,6 +317,10 @@ bool TuyaProtocol::BuildTaiContext() {
     }
 
     tai_config_t cfg = {};
+
+
+    //cfg.host = "192.168.3.97";
+    //cfg.port = 443;
     cfg.host = conn_params_.host;
     cfg.port = conn_params_.port;
     cfg.tls_sni = conn_params_.tls_sni;
@@ -322,6 +334,13 @@ bool TuyaProtocol::BuildTaiContext() {
     cfg.agent_token = conn_params_.agent_token;
     cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
     cfg.pal = tai_pal_freertos();
+
+    // Keepalive: ping every 10 s, declare the connection dead after 30 s
+    // with no inbound traffic (3 missed pings). The server normally replies
+    // to every ping, so silence here means a black-holed TCP path; the SDK
+    // worker then fires on_disconnect and the app reconnects with backoff.
+    cfg.ping_interval_ms = 10000;
+    cfg.ping_timeout_ms  = 30000;
 
     cfg.session_attrs_json =
         "{\"deviceMcp\":{\"supportCustomMCP\":true},"
@@ -361,6 +380,9 @@ bool TuyaProtocol::BuildTaiContext() {
 
 bool TuyaProtocol::RefreshTaiContext() {
     if (ctx_) {
+        // tai_ctx_deinit requires the connection to be torn down first;
+        // tai_disconnect() joins the worker thread and frees the TLS resources.
+        tai_disconnect(ctx_);
         tai_ctx_deinit(ctx_);
         ctx_ = nullptr;
     }
@@ -377,8 +399,8 @@ bool TuyaProtocol::RefreshTaiContext() {
     local_key_ = iot_client_->local_key;
     if (!FetchToken()) return false;
 
-    // iot_client_deinit(iot_client_);
-    // iot_client_ = nullptr;
+    iot_client_deinit(iot_client_);
+    iot_client_ = nullptr;
 
     if (!ParseToken()) return false;
     if (!BuildTaiContext()) return false;
@@ -420,8 +442,8 @@ bool TuyaProtocol::Start() {
     // channel uses its own TLS connection.
     before_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     before_ps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    //iot_client_deinit(iot_client_);
-    //iot_client_ = nullptr;
+    iot_client_deinit(iot_client_);
+    iot_client_ = nullptr;
     log_heap_delta("iot_client_deinit (freed)", before_int, before_ps);
 
     if (!ParseToken()) return false;
@@ -443,6 +465,15 @@ bool TuyaProtocol::Start() {
 
 bool TuyaProtocol::OpenAudioChannel() {
     if (session_active_) return true;
+
+    // An unexpected disconnect leaves the SDK ctx holding the dead TLS
+    // connection: mbedtls context + record buffers, the 4KB staging buffer,
+    // the TLS owner thread, and the exited-but-unjoined worker thread. Without
+    // this teardown tai_connect() would overwrite ctx->tls and leak all of it.
+    // tai_disconnect() is a no-op when the connection is already clean.
+    if (ctx_) {
+        tai_disconnect(ctx_);
+    }
 
     if (connect_fail_count_ >= MAX_CONNECT_FAILS_BEFORE_REFRESH) {
         ESP_LOGW(TAG, "Refreshing TAI context after %d consecutive failures", connect_fail_count_);
@@ -533,9 +564,31 @@ bool TuyaProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
     }
 
     std::lock_guard<std::mutex> lock(send_mutex_);
+    int64_t t0 = esp_timer_get_time();
     int rc = tai_send_audio_chunk(ctx_, packet->payload.data(), packet->payload.size());
+    int64_t dt_ms = (esp_timer_get_time() - t0) / 1000;
+    if (dt_ms > 100) {
+        // Anything above ~10 ms of blocking means lwIP could not accept the
+        // bytes (TCP send buffer full => peer not ACKing). Log the elapsed
+        // time so we can see how the stall develops before hard failure.
+        ESP_LOGW(TAG, "SendAudio SLOW: %lld ms for %d bytes (rc=%d)",
+                 (long long)dt_ms, (int)packet->payload.size(), rc);
+    }
     if (rc != TAI_OK) {
         ESP_LOGE(TAG, "tai_send_audio_chunk failed: %d (len=%d)", rc, (int)packet->payload.size());
+        // Diagnostic snapshot at TX failure: heap, WiFi RSSI, and whether
+        // the TCP stack still has memory. TX wedge with healthy RX usually
+        // means pbuf exhaustion or the peer stopped ACKing.
+        ESP_LOGW(TAG, "[TX-FAIL DIAG] free int heap=%u, min=%u, PSRAM=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            ESP_LOGW(TAG, "[TX-FAIL DIAG] WiFi RSSI=%d, chan=%d", ap.rssi, ap.primary);
+        } else {
+            ESP_LOGW(TAG, "[TX-FAIL DIAG] WiFi not connected!");
+        }
     }
     return rc == TAI_OK;
 }

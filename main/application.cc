@@ -45,12 +45,28 @@ Application::Application() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&clock_timer_args, &clock_timer_handle_);
+
+    esp_timer_create_args_t reconnect_timer_args = {
+        .callback = [](void* arg) {
+            Application* app = (Application*)arg;
+            xEventGroupSetBits(app->event_group_, MAIN_EVENT_RECONNECT);
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "reconnect_timer",
+        .skip_unhandled_events = true
+    };
+    esp_timer_create(&reconnect_timer_args, &reconnect_timer_handle_);
 }
 
 Application::~Application() {
     if (clock_timer_handle_ != nullptr) {
         esp_timer_stop(clock_timer_handle_);
         esp_timer_delete(clock_timer_handle_);
+    }
+    if (reconnect_timer_handle_ != nullptr) {
+        esp_timer_stop(reconnect_timer_handle_);
+        esp_timer_delete(reconnect_timer_handle_);
     }
     vEventGroupDelete(event_group_);
 }
@@ -180,7 +196,8 @@ void Application::Run() {
         MAIN_EVENT_START_LISTENING |
         MAIN_EVENT_STOP_LISTENING |
         MAIN_EVENT_ACTIVATION_DONE |
-        MAIN_EVENT_STATE_CHANGED;
+        MAIN_EVENT_STATE_CHANGED |
+        MAIN_EVENT_RECONNECT;
 
     while (true) {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
@@ -206,6 +223,22 @@ void Application::Run() {
             HandleStateChangedEvent();
         }
 
+        if (bits & MAIN_EVENT_RECONNECT) {
+            // Auto-reconnect after an unexpected channel loss (SendAudio net
+            // error or SDK disconnect). Runs in the main task like every other
+            // protocol operation. Only re-establishes the channel, then returns
+            // to idle so the next user interaction starts a clean turn.
+            if (protocol_ && !protocol_->IsAudioChannelOpened() &&
+                GetDeviceState() == kDeviceStateIdle) {
+                ESP_LOGI(TAG, "Auto-reconnecting audio channel (attempt %d)", reconnect_count_);
+                if (protocol_->OpenAudioChannel()) {
+                    SetDeviceState(kDeviceStateIdle);
+                }
+                // On failure SetError -> OnNetworkError -> ScheduleReconnect
+                // keeps retrying with backoff.
+            }
+        }
+
         if (bits & MAIN_EVENT_TOGGLE_CHAT) {
             HandleToggleChatEvent();
         }
@@ -219,10 +252,23 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
+            bool send_failed = false;
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
-                if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
+                if (protocol_ && protocol_->IsAudioChannelOpened() &&
+                    !protocol_->SendAudio(std::move(packet))) {
+                    send_failed = true;
                     break;
                 }
+            }
+            if (send_failed) {
+                // TAI_ERR_NET from SendAudio means the TLS stream is desynced/
+                // dead (bytes may be committed to the wire). Retrying would
+                // wedge send_q at max and drop AFE output forever. Tear down
+                // the channel now and schedule an auto-reconnect.
+                ESP_LOGW(TAG, "SendAudio failed, closing audio channel and draining send queue");
+                while (audio_service_.PopPacketFromSendQueue());
+                protocol_->CloseAudioChannel();
+                ScheduleReconnect();
             }
         }
 
@@ -531,6 +577,9 @@ void Application::InitializeProtocol() {
     protocol_->OnNetworkError([this](const std::string& message) {
         last_error_message_ = message;
         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
+        // Unexpected connection loss: schedule an automatic reconnect with
+        // backoff so the device self-heals without user interaction.
+        ScheduleReconnect();
     });
     
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
@@ -555,6 +604,10 @@ void Application::InitializeProtocol() {
     
     protocol_->OnAudioChannelOpened([this, codec, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+        reconnect_count_ = 0;
+        if (reconnect_timer_handle_ != nullptr) {
+            esp_timer_stop(reconnect_timer_handle_);
+        }
         if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
             ESP_LOGW(TAG, "Server sample rate %d does not match device output sample rate %d, resampling may cause distortion",
                 protocol_->server_sample_rate(), codec->output_sample_rate());
@@ -797,6 +850,22 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     }
 
     SetListeningMode(mode);
+}
+
+void Application::ScheduleReconnect() {
+    // Backoff ladder (seconds), mirroring TuyaOpen's reconnect table: 5, 10,
+    // 20, 40, 80 capped. Reset on successful (re)connection.
+    static const int kBackoff[] = {5, 10, 20, 40, 80};
+    const int kMaxIndex = sizeof(kBackoff) / sizeof(kBackoff[0]) - 1;
+    int delay = kBackoff[std::min(reconnect_count_, kMaxIndex)];
+    reconnect_count_++;
+
+    ESP_LOGW(TAG, "Scheduling audio channel reconnect in %d s (attempt %d)",
+             delay, reconnect_count_);
+    if (reconnect_timer_handle_ != nullptr) {
+        esp_timer_stop(reconnect_timer_handle_);
+        esp_timer_start_once(reconnect_timer_handle_, (uint64_t)delay * 1000000);
+    }
 }
 
 void Application::HandleStartListeningEvent() {
