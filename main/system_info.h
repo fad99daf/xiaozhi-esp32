@@ -18,6 +18,11 @@ public:
     static void PrintTaskList();
     static void PrintHeapStats();
     static void PrintPmLocks();
+    // Network-path diagnostics: prints per-layer deltas so a layer that stops
+    // advancing (WiFi driver vs lwIP vs TCP) can be identified.
+    static void PrintNetDiag();
+    // Heavyweight WiFi driver dump; call only when a fault is detected.
+    static void DumpWifiStatis();
 };
 
 #endif // _SYSTEM_INFO_H_

@@ -1,0 +1,4 @@
+# 涂鸦设备授权三元组，从涂鸦 IoT 平台获取后复制本文件为 tuya_authkey.txt 并填入真实值
+TUYA_UUID=your_uuid_here
+TUYA_AUTH_KEY=your_authkey_here
+TUYA_PRODUCT_KEY=your_product_pid_here

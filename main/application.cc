@@ -254,6 +254,7 @@ void Application::Run() {
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
+                SystemInfo::PrintNetDiag();
             }
         }
     }

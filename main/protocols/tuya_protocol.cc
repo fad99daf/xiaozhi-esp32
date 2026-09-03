@@ -1,7 +1,9 @@
 #include "tuya_protocol.h"
 #include "tuya_authkey.h"
 #include "settings.h"
+#include "system_info.h"
 #include <cstring>
+#include <cerrno>
 #include <cstdlib>
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -475,6 +477,8 @@ bool TuyaProtocol::OpenAudioChannel() {
     has_received_first_nlg_ = false;
     audio_recv_count_ = 0;
     audio_reassembly_buf_.clear();
+    MarkRx();
+    last_diag_dump_ms_ = 0;
 
     ESP_LOGI(TAG, "Audio channel opened");
     if (on_audio_channel_opened_) on_audio_channel_opened_();
@@ -533,9 +537,38 @@ bool TuyaProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
     }
 
     std::lock_guard<std::mutex> lock(send_mutex_);
+    int64_t send_t0 = esp_timer_get_time();
     int rc = tai_send_audio_chunk(ctx_, packet->payload.data(), packet->payload.size());
+    int64_t send_us = esp_timer_get_time() - send_t0;
+
+    // A 60ms audio frame that takes tens of ms to hand to TCP means the send
+    // queue is backed up; report the distribution once every 10s.
+    send_count_++;
+    send_us_total_ += send_us;
+    if (send_us > send_us_max_) send_us_max_ = send_us;
+    if (send_us > 30000) send_slow_count_++;
+    int64_t send_now_ms = esp_timer_get_time() / 1000;
+    if (send_now_ms - last_send_stat_ms_ >= 10000) {
+        last_send_stat_ms_ = send_now_ms;
+        ESP_LOGW(TAG, "[TXDIAG] send n=%d avg=%lldus max=%lldus slow(>30ms)=%d",
+                 send_count_, (long long)(send_us_total_ / (send_count_ ? send_count_ : 1)),
+                 (long long)send_us_max_, send_slow_count_);
+        send_count_ = 0; send_us_total_ = 0; send_us_max_ = 0; send_slow_count_ = 0;
+    }
+
     if (rc != TAI_OK) {
-        ESP_LOGE(TAG, "tai_send_audio_chunk failed: %d (len=%d)", rc, (int)packet->payload.size());
+        int err = errno;
+        ESP_LOGE(TAG, "tai_send_audio_chunk failed: %d (len=%d) errno=%d(%s) rx_silence=%lldms",
+                 rc, (int)packet->payload.size(), err, strerror(err),
+                 (long long)RxSilenceMs());
+        // One full driver snapshot per 10s at most - this is the moment the
+        // fault is live, so it is the only place worth dumping it.
+        int64_t now = esp_timer_get_time() / 1000;
+        if (now - last_diag_dump_ms_ > 10000) {
+            last_diag_dump_ms_ = now;
+            SystemInfo::PrintNetDiag();
+            SystemInfo::DumpWifiStatis();
+        }
     }
     return rc == TAI_OK;
 }
@@ -597,8 +630,19 @@ void TuyaProtocol::OnDisconnectCb(tai_ctx_t* ctx,
                            msg->connection_alive);
 }
 
+void TuyaProtocol::MarkRx() {
+    last_rx_ms_ = esp_timer_get_time() / 1000;
+}
+
+int64_t TuyaProtocol::RxSilenceMs() const {
+    int64_t last = last_rx_ms_.load();
+    if (last == 0) return -1;
+    return (esp_timer_get_time() / 1000) - last;
+}
+
 void TuyaProtocol::HandleAudio(const uint8_t* data, size_t len,
                                 uint32_t sample_rate, uint16_t frame_duration) {
+    MarkRx();
     audio_recv_count_++;
     if (audio_recv_count_ % 50 == 1) {
         ESP_LOGI(TAG, "HandleAudio #%d: len=%d, sr=%u, fd=%u",
@@ -640,6 +684,7 @@ void TuyaProtocol::HandleAudio(const uint8_t* data, size_t len,
 }
 
 void TuyaProtocol::HandleText(const char* text, size_t len, uint8_t stream_flag) {
+    MarkRx();
     //ESP_LOGI(TAG, "HandleText: flag=%d len=%d text=%.*s", stream_flag, (int)len,
     //         (int)(len > 200 ? 200 : len), text);
     if (!on_incoming_json_) return;
@@ -697,6 +742,7 @@ void TuyaProtocol::HandleText(const char* text, size_t len, uint8_t stream_flag)
 
 void TuyaProtocol::HandleEvent(uint16_t event_type,
                                 const uint8_t* data, size_t len) {
+    MarkRx();
     //ESP_LOGI(TAG, "HandleEvent: type=%u len=%d", event_type, (int)len);
 
     if (event_type == TAI_EVT_SERVER_VAD) {

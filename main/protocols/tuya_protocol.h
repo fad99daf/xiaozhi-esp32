@@ -60,6 +60,24 @@ private:
     int audio_recv_count_ = 0;
     std::vector<uint8_t> audio_reassembly_buf_;
 
+    // Timestamp of the last byte received from the server on any TAI stream.
+    // A growing silence while we keep sending means the RX path stalled, which
+    // is what the packet capture showed (frozen ACK, server retransmits, RST).
+    std::atomic<int64_t> last_rx_ms_{0};
+    int64_t last_diag_dump_ms_ = 0;
+    void MarkRx();
+    int64_t RxSilenceMs() const;
+
+    // How long tai_send_audio_chunk actually blocks. lwIP returns ERR_MEM once
+    // snd_queuelen hits TCP_SND_QUEUELEN (4*TCP_SND_BUF/TCP_MSS == 16 here) and
+    // a blocking socket then retries, so a full send queue shows up as latency,
+    // not as a failed send. These counters make that latency visible.
+    int64_t send_us_max_ = 0;
+    int64_t send_us_total_ = 0;
+    int send_count_ = 0;
+    int send_slow_count_ = 0;
+    int64_t last_send_stat_ms_ = 0;
+
     int connect_fail_count_ = 0;
     static const int MAX_CONNECT_FAILS_BEFORE_REFRESH = 2;
 

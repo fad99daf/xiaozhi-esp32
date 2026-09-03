@@ -9,6 +9,12 @@
 #include <esp_app_desc.h>
 #include <esp_ota_ops.h>
 #include <esp_pm.h>
+#include <esp_heap_caps.h>
+#include <lwip/stats.h>
+#include <lwip/memp.h>
+#if !CONFIG_IDF_TARGET_ESP32P4
+#include <esp_wifi.h>
+#endif
 #if CONFIG_IDF_TARGET_ESP32P4
 #include "esp_wifi_remote.h"
 #endif
@@ -153,4 +159,75 @@ void SystemInfo::PrintHeapStats() {
 
 void SystemInfo::PrintPmLocks() {
     esp_pm_dump_locks(stdout);
+}
+
+void SystemInfo::DumpWifiStatis() {
+#if !CONFIG_IDF_TARGET_ESP32P4
+    // Buffer + RX/TX + power-save counters straight from the WiFi driver.
+    esp_wifi_statis_dump(WIFI_STATIS_BUFFER | WIFI_STATIS_RXTX | WIFI_STATIS_PS);
+#endif
+}
+
+void SystemInfo::PrintNetDiag() {
+#if !CONFIG_IDF_TARGET_ESP32P4
+    int rssi = 0;
+    uint8_t chan = 0;
+    wifi_ap_record_t ap = {};
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        rssi = ap.rssi;
+        chan = ap.primary;
+    }
+    wifi_ps_type_t ps = WIFI_PS_NONE;
+    esp_wifi_get_ps(&ps);
+    uint16_t inactive = 0;
+    esp_wifi_get_inactive_time(WIFI_IF_STA, &inactive);
+
+    // WiFi RX buffers come from internal DMA-capable RAM; if this floors, the
+    // driver cannot accept frames regardless of what lwIP does.
+    size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    size_t dma_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+
+    ESP_LOGW(TAG, "[NETDIAG] wifi rssi=%d ch=%u ps=%d inactive=%us | dma_free=%u largest=%u",
+             rssi, (unsigned)chan, (int)ps, (unsigned)inactive,
+             (unsigned)dma_free, (unsigned)dma_block);
+#endif
+
+#if LWIP_STATS
+    // Deltas, not totals: the layer whose counter stops moving is the culprit.
+    // MEM_STATS is unavailable here (lwIP is built with MEM_LIBC_MALLOC=1), so
+    // memory pressure shows up as the per-layer memerr counters plus PBUF_POOL.
+    static unsigned long p_lr, p_ld, p_lme, p_ir, p_id, p_tr, p_td, p_tme, p_tx, p_trt;
+    unsigned long lr  = (unsigned long)lwip_stats.link.recv;
+    unsigned long ld  = (unsigned long)lwip_stats.link.drop;
+    unsigned long lme = (unsigned long)lwip_stats.link.memerr;
+    unsigned long ir  = (unsigned long)lwip_stats.ip.recv;
+    unsigned long id  = (unsigned long)lwip_stats.ip.drop;
+    unsigned long tr  = (unsigned long)lwip_stats.tcp.recv;
+    unsigned long td  = (unsigned long)lwip_stats.tcp.drop;
+    unsigned long tme = (unsigned long)lwip_stats.tcp.memerr;
+    // xmit vs memerr tells apart "we sent a lot" from "we could not enqueue";
+    // rterr rising alongside means the retransmit path is involved too.
+    unsigned long tx  = (unsigned long)lwip_stats.tcp.xmit;
+    unsigned long trt = (unsigned long)lwip_stats.tcp.rterr;
+
+    ESP_LOGW(TAG, "[NETDIAG] d.link(recv=%lu drop=%lu memerr=%lu) d.ip(recv=%lu drop=%lu) "
+                  "d.tcp(recv=%lu xmit=%lu drop=%lu memerr=%lu rterr=%lu)",
+             lr - p_lr, ld - p_ld, lme - p_lme, ir - p_ir, id - p_id,
+             tr - p_tr, tx - p_tx, td - p_td, tme - p_tme, trt - p_trt);
+
+    p_lr = lr; p_ld = ld; p_lme = lme; p_ir = ir; p_id = id;
+    p_tr = tr; p_td = td; p_tme = tme; p_tx = tx; p_trt = trt;
+
+#if MEMP_STATS
+    // PBUF_POOL exhaustion is the direct signal for "driver had no buffer".
+    const struct stats_mem* pp = lwip_stats.memp[MEMP_PBUF_POOL];
+    if (pp != nullptr) {
+        ESP_LOGW(TAG, "[NETDIAG] pbuf_pool err=%lu used=%u max=%u avail=%u",
+                 (unsigned long)pp->err, (unsigned)pp->used,
+                 (unsigned)pp->max, (unsigned)pp->avail);
+    }
+#endif
+#else
+    ESP_LOGW(TAG, "[NETDIAG] lwIP stats disabled (set CONFIG_LWIP_STATS=y)");
+#endif
 }
