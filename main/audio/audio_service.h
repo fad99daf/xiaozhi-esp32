@@ -167,6 +167,10 @@ public:
 
     void EnableWakeWordDetection(bool enable);
     void EnableVoiceProcessing(bool enable);
+    // Create the audio processor (AFE instance + tasks) ahead of time, e.g.
+    // when the device becomes idle after activation, while internal RAM is
+    // still plentiful. Safe to call multiple times.
+    void PreInitializeAudioProcessor();
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
 

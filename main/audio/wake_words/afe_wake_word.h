@@ -41,6 +41,9 @@ private:
     char* wakenet_model_ = NULL;
     std::vector<std::string> wake_words_;
     EventGroupHandle_t event_group_;
+    // Detection task with PSRAM-backed stack (robust against low internal RAM).
+    StackType_t* detection_task_stack_ = nullptr;
+    StaticTask_t* detection_task_buffer_ = nullptr;
     std::function<void(const std::string& wake_word)> wake_word_detected_callback_;
     AudioCodec* codec_ = nullptr;
     std::string last_detected_wake_word_;

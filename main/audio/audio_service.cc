@@ -647,6 +647,22 @@ void AudioService::EnableWakeWordDetection(bool enable) {
     }
 }
 
+void AudioService::PreInitializeAudioProcessor() {
+    if (audio_processor_initialized_) {
+        return;
+    }
+    // Create the AFE instance and its tasks now, while internal RAM is still
+    // plentiful (right after activation, before the TAI TLS connection).
+    // Doing this lazily on the first entry into the listening state risks
+    // task-creation failures due to exhausted/fragmented internal RAM, which
+    // would silently stop the audio uplink ("Ringbuffer of AFE(FEED) is full").
+    // Note: must NOT be called before activation — the AFE's internal RAM
+    // footprint (~10-30KB incl. the esp-sr task stack) would starve the IoT
+    // HTTP buffers used during activation.
+    audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
+    audio_processor_initialized_ = true;
+}
+
 void AudioService::EnableVoiceProcessing(bool enable) {
     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
     if (enable) {

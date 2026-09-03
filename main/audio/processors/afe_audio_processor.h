@@ -33,6 +33,11 @@ private:
     EventGroupHandle_t event_group_ = nullptr;
     const esp_afe_sr_iface_t* afe_iface_ = nullptr;
     esp_afe_sr_data_t* afe_data_ = nullptr;
+    // Fetch task with PSRAM-backed stack (internal RAM may be exhausted
+    // by the TAI TLS / IoT MQTT connections when the processor is created).
+    StackType_t* task_stack_ = nullptr;
+    StaticTask_t* task_buffer_ = nullptr;
+    bool initialized_ = false;
     std::function<void(std::vector<int16_t>&& data)> output_callback_;
     std::function<void(bool speaking)> vad_state_change_callback_;
     AudioCodec* codec_ = nullptr;

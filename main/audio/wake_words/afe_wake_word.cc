@@ -28,6 +28,14 @@ AfeWakeWord::~AfeWakeWord() {
         heap_caps_free(wake_word_encode_task_buffer_);
     }
 
+    if (detection_task_stack_ != nullptr) {
+        heap_caps_free(detection_task_stack_);
+    }
+
+    if (detection_task_buffer_ != nullptr) {
+        heap_caps_free(detection_task_buffer_);
+    }
+
     if (models_ != nullptr) {
         esp_srmodel_deinit(models_);
     }
@@ -79,12 +87,38 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
+    if (afe_data_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create AFE instance for wake word");
+        return false;
+    }
 
-    xTaskCreate([](void* arg) {
+    // Create the detection task with a PSRAM-backed stack so it cannot fail
+    // due to exhausted internal RAM (which would silently disable wake word).
+    const size_t task_stack_size = 8192;
+    detection_task_stack_ = (StackType_t*)heap_caps_malloc(task_stack_size, MALLOC_CAP_SPIRAM);
+    detection_task_buffer_ = (StaticTask_t*)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    if (detection_task_stack_ == nullptr || detection_task_buffer_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to allocate detection task stack/TCB (stack=%p, tcb=%p)",
+                 detection_task_stack_, detection_task_buffer_);
+        heap_caps_free(detection_task_stack_);
+        detection_task_stack_ = nullptr;
+        heap_caps_free(detection_task_buffer_);
+        detection_task_buffer_ = nullptr;
+        return false;
+    }
+    TaskHandle_t task = xTaskCreateStatic([](void* arg) {
         auto this_ = (AfeWakeWord*)arg;
         this_->AudioDetectionTask();
         vTaskDelete(NULL);
-    }, "audio_detection", 4096, this, 3, nullptr);
+    }, "audio_detect", task_stack_size, this, 3, detection_task_stack_, detection_task_buffer_);
+    if (task == nullptr) {
+        ESP_LOGE(TAG, "Failed to create audio detection task");
+        heap_caps_free(detection_task_stack_);
+        detection_task_stack_ = nullptr;
+        heap_caps_free(detection_task_buffer_);
+        detection_task_buffer_ = nullptr;
+        return false;
+    }
 
     return true;
 }

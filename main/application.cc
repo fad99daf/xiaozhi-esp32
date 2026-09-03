@@ -944,6 +944,9 @@ void Application::HandleStateChangedEvent() {
             display->ClearChatMessages();  // Clear messages first
             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
+            // Create the audio processor while internal RAM is still plentiful
+            // (after activation, before the first TAI TLS connection).
+            audio_service_.PreInitializeAudioProcessor();
             audio_service_.EnableWakeWordDetection(true);
             break;
         case kDeviceStateConnecting:
@@ -1204,4 +1207,3 @@ void Application::ResetProtocol() {
         protocol_.reset();
     });
 }
-

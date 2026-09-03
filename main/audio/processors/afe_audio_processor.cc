@@ -1,5 +1,6 @@
 #include "afe_audio_processor.h"
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 
 #define PROCESSOR_RUNNING 0x01
 
@@ -66,17 +67,60 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
 
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
-    
-    xTaskCreate([](void* arg) {
+    if (afe_data_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create AFE instance");
+        return;
+    }
+
+    // Create the fetch task with a PSRAM-backed stack.
+    // Internal RAM can be nearly exhausted by the time this runs (TAI TLS
+    // handshake + IoT MQTT TLS connection). A failed task creation is fatal
+    // for the audio uplink: nobody fetches from the AFE, its input ring
+    // buffer overflows ("Ringbuffer of AFE(FEED) is full") and no audio is
+    // ever sent to the server.
+    const size_t task_stack_size = 8192;
+    if (task_stack_ == nullptr) {
+        task_stack_ = (StackType_t*)heap_caps_malloc(task_stack_size, MALLOC_CAP_SPIRAM);
+    }
+    if (task_buffer_ == nullptr) {
+        task_buffer_ = (StaticTask_t*)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    }
+    if (task_stack_ == nullptr || task_buffer_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to allocate task stack/TCB (stack=%p, tcb=%p)",
+                 task_stack_, task_buffer_);
+        heap_caps_free(task_stack_);
+        task_stack_ = nullptr;
+        heap_caps_free(task_buffer_);
+        task_buffer_ = nullptr;
+        return;
+    }
+    TaskHandle_t task = xTaskCreateStatic([](void* arg) {
         auto this_ = (AfeAudioProcessor*)arg;
         this_->AudioProcessorTask();
         vTaskDelete(NULL);
-    }, "audio_communication", 4096, this, 3, NULL);
+    }, "audio_comm", task_stack_size, this, 3, task_stack_, task_buffer_);
+    if (task == nullptr) {
+        ESP_LOGE(TAG, "Failed to create audio communication task");
+        heap_caps_free(task_stack_);
+        task_stack_ = nullptr;
+        heap_caps_free(task_buffer_);
+        task_buffer_ = nullptr;
+        return;
+    }
+    initialized_ = true;
 }
 
 AfeAudioProcessor::~AfeAudioProcessor() {
     if (afe_data_ != nullptr) {
         afe_iface_->destroy(afe_data_);
+    }
+    if (task_stack_ != nullptr) {
+        heap_caps_free(task_stack_);
+        task_stack_ = nullptr;
+    }
+    if (task_buffer_ != nullptr) {
+        heap_caps_free(task_buffer_);
+        task_buffer_ = nullptr;
     }
     vEventGroupDelete(event_group_);
 }
@@ -90,6 +134,14 @@ size_t AfeAudioProcessor::GetFeedSize() {
 
 void AfeAudioProcessor::Feed(std::vector<int16_t>&& data) {
     if (afe_data_ == nullptr) {
+        return;
+    }
+    if (!initialized_) {
+        // Should never happen: the fetch task failed to start, audio uplink is dead.
+        static int err_count = 0;
+        if (++err_count % 50 == 1) {
+            ESP_LOGE(TAG, "Fetch task not running, audio will NOT be sent (init failed)");
+        }
         return;
     }
 
