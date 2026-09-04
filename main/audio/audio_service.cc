@@ -469,13 +469,6 @@ void AudioService::OpusCodecTask() {
                 auto ret = esp_opus_enc_process(opus_encoder_, &in, &out);
                 if (ret == ESP_AUDIO_ERR_OK) {
                     packet->payload.assign(buf.data(), buf.data() + out.encoded_bytes);
-                    // Log every 50th frame to verify CBR output
-                    static int enc_log_cnt = 0;
-                    if (++enc_log_cnt % 50 == 1) {
-                        ESP_LOGI(TAG, "Encoded frame #%d: %u bytes (CBR expects ~120 bytes for 60ms@16kbps)",
-                                 enc_log_cnt, (unsigned)out.encoded_bytes);
-                    }
-
                     if (task->type == kAudioTaskTypeEncodeToSendQueue) {
                         {
                             std::lock_guard<std::mutex> lock2(audio_queue_mutex_);

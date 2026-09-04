@@ -58,7 +58,17 @@ private:
     bool has_received_first_nlg_ = false;
     std::atomic<bool> audio_end_pending_{false};
     int audio_recv_count_ = 0;
+    int turn_count_ = 0;
+    bool first_tts_audio_pending_ = false;
     std::vector<uint8_t> audio_reassembly_buf_;
+
+    // Uplink opus batching (all accesses under send_mutex_)
+    std::vector<uint8_t> audio_batch_buf_;
+    // Next chunk goes out alone: the SDK derives the START packet's
+    // audio-params (frame size/duration/bitrate) from that chunk's length,
+    // so it must be exactly one 80-byte CBR frame.
+    bool audio_batch_solo_next_ = true;
+    bool FlushAudioBatchLocked();
 
     int connect_fail_count_ = 0;
     static const int MAX_CONNECT_FAILS_BEFORE_REFRESH = 2;

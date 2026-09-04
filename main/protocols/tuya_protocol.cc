@@ -22,6 +22,12 @@ extern "C" {
 #define TAI_OPUS_FRAME_DURATION_MS 40
 #define TAI_OPUS_FRAME_SIZE_BYTES  80
 
+// Uplink batching: accumulate N opus frames and send them as one AUDIO packet
+// (same wire format as TuyaOpen's batched upload; the server splits by the
+// frame_size advertised in audio-params).
+#define TAI_OPUS_BATCH_FRAMES 5
+#define TAI_OPUS_BATCH_BYTES  (TAI_OPUS_BATCH_FRAMES * TAI_OPUS_FRAME_SIZE_BYTES)
+
 // --- Minimal JSON helpers (matching threaded_chat pattern) ---
 
 static const char *json_find_value(const char *json, const char *key)
@@ -473,6 +479,8 @@ bool TuyaProtocol::OpenAudioChannel() {
     has_received_first_nlg_ = false;
     audio_recv_count_ = 0;
     audio_reassembly_buf_.clear();
+    audio_batch_buf_.clear();
+    audio_batch_solo_next_ = true;
 
     ESP_LOGI(TAG, "Audio channel opened");
     if (on_audio_channel_opened_) on_audio_channel_opened_();
@@ -485,6 +493,13 @@ void TuyaProtocol::CloseAudioChannel(bool send_goodbye) {
     tai_disconnect(ctx_);
     connected_ = false;
     session_active_ = false;
+
+    // Session is gone — drop any unsent batched frames.
+    {
+        std::lock_guard<std::mutex> lock(send_mutex_);
+        audio_batch_buf_.clear();
+        audio_batch_solo_next_ = true;
+    }
 
     ESP_LOGI(TAG, "Audio channel closed");
     if (on_audio_channel_closed_) on_audio_channel_closed_();
@@ -504,6 +519,10 @@ void TuyaProtocol::SendStartListening(ListeningMode mode) {
     audio_end_pending_ = false;
 
     std::lock_guard<std::mutex> lock(send_mutex_);
+    // Drop any stale batched frames from a previous stream; the next SendAudio
+    // goes out solo so the START chunk advertises correct 40ms/80B params.
+    audio_batch_buf_.clear();
+    audio_batch_solo_next_ = true;
     int rc = tai_send_audio_start(ctx_, TAI_AUDIO_OPUS, 1, 16, 16000);
     ESP_LOGI(TAG, "tai_send_audio_start rc=%d", rc);
     is_first_audio_packet_ = false;
@@ -531,16 +550,49 @@ bool TuyaProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
     }
 
     std::lock_guard<std::mutex> lock(send_mutex_);
-    int rc = tai_send_audio_chunk(ctx_, packet->payload.data(), packet->payload.size());
-    if (rc != TAI_OK) {
-        ESP_LOGE(TAG, "tai_send_audio_chunk failed: %d (len=%d)", rc, (int)packet->payload.size());
+
+    // First chunk of a stream goes out solo: tai_send_audio_chunk attaches the
+    // START flag and derives audio-params (frame size/duration/bitrate) from
+    // the chunk length, so it must be exactly one 80-byte CBR frame.
+    if (audio_batch_solo_next_) {
+        int rc = tai_send_audio_chunk(ctx_, packet->payload.data(), packet->payload.size());
+        if (rc != TAI_OK) {
+            ESP_LOGE(TAG, "tai_send_audio_chunk failed: %d (len=%d)", rc, (int)packet->payload.size());
+            return false;
+        }
+        audio_batch_solo_next_ = false;
+        return true;
     }
-    return rc == TAI_OK;
+
+    // Batch subsequent frames: one AUDIO packet per TAI_OPUS_BATCH_FRAMES frames.
+    audio_batch_buf_.insert(audio_batch_buf_.end(),
+                            packet->payload.begin(), packet->payload.end());
+    if (audio_batch_buf_.size() < TAI_OPUS_BATCH_BYTES) {
+        return true;
+    }
+    return FlushAudioBatchLocked();
+}
+
+bool TuyaProtocol::FlushAudioBatchLocked() {
+    if (audio_batch_buf_.empty()) return true;
+    size_t len = audio_batch_buf_.size();
+    int rc = tai_send_audio_chunk(ctx_, audio_batch_buf_.data(), len);
+    // Drop the batch on failure: TAI_ERR_NET means a dead TLS stream, so
+    // retrying stale audio is pointless (see SendAudio teardown contract).
+    audio_batch_buf_.clear();
+    if (rc != TAI_OK) {
+        ESP_LOGE(TAG, "tai_send_audio_chunk failed: %d (batched len=%d)", rc, (int)len);
+        return false;
+    }
+    return true;
 }
 
 void TuyaProtocol::SendStopListening() {
     if (!ctx_ || !session_active_) return;
     std::lock_guard<std::mutex> lock(send_mutex_);
+    // Trailing batched frames must go out before the audio END, otherwise the
+    // tail of the utterance (up to TAI_OPUS_BATCH_FRAMES-1 frames) is lost.
+    FlushAudioBatchLocked();
     ESP_LOGW(TAG, "[BARGE-IN] tai_send_audio_end (stopping audio stream)");
     tai_send_audio_end(ctx_);
     is_first_audio_packet_ = true;
@@ -601,6 +653,11 @@ void TuyaProtocol::HandleAudio(const uint8_t* data, size_t len,
     if (audio_recv_count_ % 50 == 1) {
         ESP_LOGI(TAG, "HandleAudio #%d: len=%d, sr=%u, fd=%u",
                  audio_recv_count_, (int)len, sample_rate, frame_duration);
+    }
+    if (first_tts_audio_pending_ && len > 0) {
+        first_tts_audio_pending_ = false;
+        ESP_LOGI(TAG, "First TTS audio packet of turn #%d: len=%d, sr=%u, fd=%u",
+                 turn_count_, (int)len, sample_rate, frame_duration);
     }
     if (!on_incoming_audio_ || len == 0) return;
 
@@ -663,6 +720,13 @@ void TuyaProtocol::HandleText(const char* text, size_t len, uint8_t stream_flag)
     }
 
     if (strcmp(bizType->valuestring, "ASR") == 0) {
+        // ASR repeats interim results of the same utterance; only forward the
+        // final recognition result (eof=1). Matches TuyaOpen's handling.
+        cJSON* eof = cJSON_GetObjectItem(root, "eof");
+        if (!cJSON_IsNumber(eof) || (int)eof->valuedouble != 1) {
+            cJSON_Delete(root);
+            return;
+        }
         cJSON* t = cJSON_GetObjectItem(dataObj, "text");
         if (cJSON_IsString(t) && strlen(t->valuestring) > 0) {
             cJSON* out = cJSON_CreateObject();
@@ -681,6 +745,8 @@ void TuyaProtocol::HandleText(const char* text, size_t len, uint8_t stream_flag)
                 on_incoming_json_(start);
                 cJSON_Delete(start);
                 has_received_first_nlg_ = true;
+                first_tts_audio_pending_ = true;
+                turn_count_++;
             }
             cJSON* out = cJSON_CreateObject();
             cJSON_AddStringToObject(out, "type", "tts");
