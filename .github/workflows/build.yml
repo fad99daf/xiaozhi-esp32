@@ -13,6 +13,13 @@ permissions:
   contents: read
 
 jobs:
+  audio-abort-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audio abort regression (ASan and UBSan)
+        run: python3 -m unittest discover -s tests -p 'test_audio_abort.py' -v
+
   prepare:
     name: Determine variants to build
     runs-on: ubuntu-latest

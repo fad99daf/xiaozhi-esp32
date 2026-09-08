@@ -205,6 +205,7 @@ void AudioService::Stop() {
         AS_EVENT_AUDIO_PROCESSOR_RUNNING);
 
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    ++output_generation_;
     audio_encode_queue_.clear();
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
@@ -326,6 +327,7 @@ void AudioService::AudioOutputTask() {
             break;
         }
 
+        const auto generation = output_generation_.load();
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
         audio_queue_cv_.notify_all();
@@ -333,7 +335,7 @@ void AudioService::AudioOutputTask() {
 
         // Check abort before playing — discards any frame already popped
         // from the queue before ResetDecoder() cleared it.
-        if (output_aborted_) {
+        if (output_aborted_ || generation != output_generation_.load()) {
             continue;
         }
 
@@ -343,6 +345,10 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
 
+        // Enabling output can block while an abort/reset invalidates this frame.
+        if (output_aborted_ || generation != output_generation_.load()) {
+            continue;
+        }
         codec_->OutputData(task->pcm);
 
         /* Update the last output time */
@@ -353,7 +359,9 @@ void AudioService::AudioOutputTask() {
         /* Record the timestamp for server AEC */
         if (task->timestamp > 0) {
             lock.lock();
-            timestamp_queue_.push_back(task->timestamp);
+            if (generation == output_generation_.load()) {
+                timestamp_queue_.push_back(task->timestamp);
+            }
         }
 #endif
     }
@@ -375,6 +383,7 @@ void AudioService::OpusCodecTask() {
 
         /* Decode the audio from decode queue */
         if (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
+            const auto generation = output_generation_.load();
             auto packet = std::move(audio_decode_queue_.front());
             audio_decode_queue_.pop_front();
             audio_queue_cv_.notify_all();
@@ -400,6 +409,9 @@ void AudioService::OpusCodecTask() {
                 };
                 esp_audio_dec_info_t dec_info = {};
                 std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
+                if (generation != output_generation_.load()) {
+                    continue;
+                }
                 auto ret = esp_opus_dec_decode(opus_decoder_, &raw, &out_frame, &dec_info);
                 // If the output buffer was too small, grow it to the reported
                 // needed_size and retry once (matches esp_audio_codec usage).
@@ -426,7 +438,7 @@ void AudioService::OpusCodecTask() {
                     // Check abort before pushing to playback — this prevents the race
                     // where ResetDecoder() cleared the queues but a decode was already
                     // in-flight (frame popped before the clear).
-                    if (output_aborted_) {
+                    if (output_aborted_ || generation != output_generation_.load()) {
                         lock.unlock();
                         continue;
                     }
@@ -505,7 +517,7 @@ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
         esp_opus_dec_close(opus_decoder_);
         opus_decoder_ = nullptr;
     }
-    decoder_lock.unlock();
+    // Keep reset serialized with both closing and publishing the new decoder.
     esp_opus_dec_cfg_t opus_dec_cfg = OPUS_DEC_CFG(sample_rate, frame_duration);
     auto ret = esp_opus_dec_open(&opus_dec_cfg, sizeof(esp_opus_dec_cfg_t), &opus_decoder_);
     if (opus_decoder_ == nullptr) {
@@ -557,15 +569,17 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
 
 bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    const auto generation = output_generation_.load();
     if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
         if (wait) {
             ESP_LOGW(TAG, "[BARGE-IN] Decode queue full (%d), blocking TAI recv thread (send_q=%d, enc_q=%d, play_q=%d)",
                      (int)audio_decode_queue_.size(), (int)audio_send_queue_.size(),
                      (int)audio_encode_queue_.size(), (int)audio_playback_queue_.size());
-            audio_queue_cv_.wait(lock, [this]() {
-                return service_stopped_ || audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE;
+            audio_queue_cv_.wait(lock, [this, generation]() {
+                return service_stopped_ || generation != output_generation_.load() ||
+                    audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE;
             });
-            if (service_stopped_) return false;
+            if (service_stopped_ || generation != output_generation_.load()) return false;
         } else {
             return false;
         }
@@ -740,6 +754,7 @@ void AudioService::WaitForPlaybackQueueEmpty() {
 
 void AudioService::ResetDecoder() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    ++output_generation_;
     std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
     if (opus_decoder_ != nullptr) {
         esp_opus_dec_reset(opus_decoder_);
@@ -758,6 +773,7 @@ void AudioService::FlushAudioQueues() {
     // output_aborted_ — just drains the queues.  Used for normal state
     // transitions where we want fresh queues but not an abort signal.
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    ++output_generation_;
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
     audio_testing_queue_.clear();
@@ -767,7 +783,11 @@ void AudioService::FlushAudioQueues() {
 void AudioService::AbortOutput() {
     // Stop audio output immediately: clear all queues and signal the
     // worker tasks to drop any frames that were already popped before
-    // the clear.  Called from Application::AbortSpeaking / CHAT_BREAK handler.
+    // the clear. Called from Application::AbortSpeaking / CHAT_BREAK handler.
+    // clear() destroys owned packets: serialize with every producer/consumer
+    // move/pop, otherwise deque corruption and double frees are possible.
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    ++output_generation_;
     ESP_LOGW(TAG, "AbortOutput: clearing %d decode + %d playback packets",
              (int)audio_decode_queue_.size(), (int)audio_playback_queue_.size());
     output_aborted_ = true;

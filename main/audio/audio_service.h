@@ -1,6 +1,7 @@
 #ifndef AUDIO_SERVICE_H
 #define AUDIO_SERVICE_H
 
+#include <atomic>
 #include <memory>
 #include <deque>
 #include <condition_variable>
@@ -226,7 +227,10 @@ private:
     bool voice_detected_ = false;
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;
-    bool output_aborted_ = false;
+    std::atomic<bool> output_aborted_{false};
+    // Increment under audio_queue_mutex_ whenever queued output is invalidated.
+    // Workers retain a snapshot while decoding/playing outside that mutex.
+    std::atomic<uint32_t> output_generation_{0};
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;
