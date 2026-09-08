@@ -1,8 +1,16 @@
 #include "tuya_protocol.h"
 #include "tuya_auth.h"
 #include "settings.h"
+#include "application.h"
+#include "board.h"
+#include "display.h"
+#include "assets/lang_config.h"
+#include <ssid_manager.h>
 #include <cstring>
 #include <cstdlib>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <esp_system.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <esp_heap_caps.h>
@@ -131,6 +139,7 @@ TuyaProtocol::TuyaProtocol() {
 }
 
 TuyaProtocol::~TuyaProtocol() {
+    StopMqttPump();
     if (ctx_) {
         tai_disconnect(ctx_);
         tai_ctx_deinit(ctx_);
@@ -160,10 +169,16 @@ bool TuyaProtocol::InitIotClient() {
         cfg.mqtt_disable_tls = false;
         cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
         cfg.sw_ver = esp_app_get_description()->version;
+        // Cloud-initiated device-remove (protocol 11) notice: subscribing to it
+        // keeps the client in charge of consuming the push, and the pump task
+        // started below is what actually delivers it (iot_client_process).
+        cfg.reset_callback = OnCloudReset;
+        cfg.reset_user_data = this;
 
         iot_client_ = iot_client_init(&cfg);
         if (iot_client_) {
             ESP_LOGI(TAG, "IoT client initialized from NVS (devid=%s)", nvs_devid.c_str());
+            StartMqttPump();
             return true;
         }
         ESP_LOGW(TAG, "NVS credentials failed, trying on-boarding...");
@@ -215,6 +230,151 @@ bool TuyaProtocol::OnBoardWithToken(const std::string& token) {
     // don't Free the client —  the mqtt is used by data point management
     //iot_client_deinit(client);
     return true;
+}
+
+// --- Cloud-initiated unbind (protocol 11) handling ---
+//
+// The Tuya cloud pushes a device-remove notice over MQTT when the user removes
+// the device from the app (reference: examples/posix/pair/unbind-demo). The
+// SDK delivers it via reset_callback, which fires on the iot_client_process()
+// thread and MUST NOT block or tear the client down (the MQTT receive loop is
+// still using its context). So the callback only sets a flag; the pump loop
+// below performs the teardown after iot_client_process() returns.
+
+void TuyaProtocol::OnCloudReset(iot_reset_type_t type, void* user) {
+    auto self = static_cast<TuyaProtocol*>(user);
+    ESP_LOGW(TAG, "*** Device removed from cloud (type=%s) ***",
+             type == IOT_RESET_REMOTE_FACTORY ? "factory_reset" : "remote_unbind");
+    self->reset_pending_ = true;  // flag only; handled by MqttPumpLoop
+}
+
+bool TuyaProtocol::StartMqttPump() {
+    if (mqtt_pump_running_.exchange(true)) return true;
+
+    constexpr size_t kMqttPumpStackWords = 6144;
+    mqtt_pump_stack_ = static_cast<StackType_t*>(
+        heap_caps_malloc(kMqttPumpStackWords * sizeof(StackType_t), MALLOC_CAP_SPIRAM));
+    mqtt_pump_task_buffer_ = static_cast<StaticTask_t*>(
+        heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL));
+    mqtt_pump_done_ = xSemaphoreCreateBinaryStatic(&mqtt_pump_done_buffer_);
+    if (!mqtt_pump_stack_ || !mqtt_pump_task_buffer_ || !mqtt_pump_done_) {
+        ESP_LOGE(TAG, "Failed to allocate MQTT pump task resources");
+        if (mqtt_pump_stack_) free(mqtt_pump_stack_);
+        if (mqtt_pump_task_buffer_) free(mqtt_pump_task_buffer_);
+        mqtt_pump_stack_ = nullptr;
+        mqtt_pump_task_buffer_ = nullptr;
+        mqtt_pump_done_ = nullptr;
+        mqtt_pump_running_ = false;
+        return false;
+    }
+
+    mqtt_pump_task_ = xTaskCreateStatic(MqttPumpTrampoline, "tuya_mqtt", kMqttPumpStackWords,
+                                        this, tskIDLE_PRIORITY + 5, mqtt_pump_stack_,
+                                        mqtt_pump_task_buffer_);
+    if (!mqtt_pump_task_) {
+        ESP_LOGE(TAG, "Failed to create MQTT pump task");
+        free(mqtt_pump_stack_);
+        free(mqtt_pump_task_buffer_);
+        mqtt_pump_stack_ = nullptr;
+        mqtt_pump_task_buffer_ = nullptr;
+        mqtt_pump_done_ = nullptr;
+        mqtt_pump_running_ = false;
+        return false;
+    }
+    return true;
+}
+
+void TuyaProtocol::StopMqttPump() {
+    mqtt_pump_running_ = false;
+    if (!mqtt_pump_task_) return;
+
+    // Wait even if the pump already marked itself stopped while handing a
+    // cloud reset to the application task: it may still be unwinding its
+    // receive loop and accessing iot_client_.
+    if (mqtt_pump_done_) {
+        xSemaphoreTake(mqtt_pump_done_, portMAX_DELAY);
+    }
+    vTaskDelete(mqtt_pump_task_);
+    mqtt_pump_task_ = nullptr;
+    free(mqtt_pump_stack_);
+    free(mqtt_pump_task_buffer_);
+    mqtt_pump_stack_ = nullptr;
+    mqtt_pump_task_buffer_ = nullptr;
+    mqtt_pump_done_ = nullptr;
+}
+
+void TuyaProtocol::MqttPumpTrampoline(void* arg) {
+    auto self = static_cast<TuyaProtocol*>(arg);
+    self->MqttPumpLoop();
+    xSemaphoreGive(self->mqtt_pump_done_);
+    vTaskSuspend(nullptr);
+}
+
+void TuyaProtocol::MqttPumpLoop() {
+    ESP_LOGI(TAG, "MQTT pump started (waiting for cloud device-remove notices)");
+    int backoff_ms = 2000;
+
+    while (mqtt_pump_running_) {
+        iot_client_t* client = iot_client_;
+        if (!client) break;
+
+        int rc = iot_client_process(client, 500);
+
+        if (reset_pending_.exchange(false)) {
+            // NVS writes disable the SPI flash cache. They cannot run on this
+            // task because its stack is in PSRAM, so transfer the reset to the
+            // application task, which has an internal-RAM stack.
+            mqtt_pump_running_ = false;
+            Application::GetInstance().Schedule([this]() {
+                HandleCloudReset();
+            });
+            break;
+        }
+
+        if (rc != OPRT_OK) {
+            // Link dropped (keepalive timeout, transport error, not yet
+            // connected): tear down and reconnect with backoff so the
+            // device-remove notice can still arrive later.
+            if (!mqtt_pump_running_) break;
+            iot_client_disconnect(client);
+            for (int waited = 0; waited < backoff_ms && mqtt_pump_running_; waited += 200) {
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
+            if (!mqtt_pump_running_) break;
+            if (iot_client_connect(client) == OPRT_OK) {
+                ESP_LOGI(TAG, "MQTT reconnected");
+                backoff_ms = 2000;
+            } else {
+                if (backoff_ms < 60000) backoff_ms *= 2;
+            }
+        }
+    }
+    ESP_LOGI(TAG, "MQTT pump stopped");
+}
+
+// This always runs on Application's internal-RAM main task. NVS operations
+// temporarily disable the flash cache, so they cannot execute on the PSRAM-
+// backed MQTT pump task.
+void TuyaProtocol::HandleCloudReset() {
+    StopMqttPump();
+
+    // Close the audio session first: its TLS stream is signed with the keys
+    // we are about to erase.
+    CloseAudioChannel(false);
+
+    {
+        Settings settings("tuya", true);
+        settings.EraseAll();
+    }
+    SsidManager::GetInstance().Clear();
+
+    auto display = Board::GetInstance().GetDisplay();
+    if (display) {
+        display->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(3000));  // let the notification show
+    esp_restart();
 }
 
 bool TuyaProtocol::FetchToken() {
@@ -383,12 +543,17 @@ bool TuyaProtocol::RefreshTaiContext() {
         token_ = nullptr;
     }
 
+    // Replace the IoT client cleanly: the pump task must be stopped and the
+    // old client freed before InitIotClient() assigns a new pointer.
+    StopMqttPump();
+    if (iot_client_) {
+        iot_client_deinit(iot_client_);
+        iot_client_ = nullptr;
+    }
+
     if (!InitIotClient()) return false;
     local_key_ = iot_client_->local_key;
     if (!FetchToken()) return false;
-
-    // iot_client_deinit(iot_client_);
-    // iot_client_ = nullptr;
 
     if (!ParseToken()) return false;
     if (!BuildTaiContext()) return false;

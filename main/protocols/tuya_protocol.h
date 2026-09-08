@@ -6,6 +6,9 @@ extern "C" {
     #include "tuya_ai.h"
     #include "iot_client.h"
 }
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <mutex>
 #include <atomic>
 #include <vector>
@@ -36,6 +39,23 @@ private:
     iot_client_t* iot_client_ = nullptr;
     char* token_ = nullptr;
     std::string local_key_;  // from NVS after on-boarding
+
+    // Cloud-initiated unbind (protocol 11): the device was removed from the
+    // Tuya app. The MQTT link must be pumped to receive the notice.
+    std::atomic<bool> reset_pending_{false};
+    std::atomic<bool> mqtt_pump_running_{false};
+    TaskHandle_t mqtt_pump_task_ = nullptr;
+    StackType_t* mqtt_pump_stack_ = nullptr;
+    StaticTask_t* mqtt_pump_task_buffer_ = nullptr;
+    StaticSemaphore_t mqtt_pump_done_buffer_;
+    SemaphoreHandle_t mqtt_pump_done_ = nullptr;
+
+    bool StartMqttPump();
+    void StopMqttPump();
+    void MqttPumpLoop();
+    static void MqttPumpTrampoline(void* arg);
+    static void OnCloudReset(iot_reset_type_t type, void* user);
+    void HandleCloudReset();
 
     struct ConnParams {
         char host[256] = {};
