@@ -156,11 +156,12 @@ void WifiBoard::TryWifiConnect() {
             // BLE timed out, show notification and retry
             GetDisplay()->ShowNotification("BLE配网超时，重试中...", 3000);
         }
-#endif
+#else
         // No SSID configured, enter config mode
         // Wait for the board version to be shown
         vTaskDelay(pdMS_TO_TICKS(1500));
         StartWifiConfigMode();
+#endif
     }
 }
 
@@ -211,10 +212,19 @@ void WifiBoard::SetNetworkEventCallback(NetworkEventCallback callback) {
 
 void WifiBoard::OnWifiConnectTimeout(void* arg) {
     auto* board = static_cast<WifiBoard*>(arg);
+#if CONFIG_TUYA_BLE_PROVISIONING
+    // No SoftAP fallback: clear WiFi credentials and reboot so BLE
+    // provisioning re-runs on next boot (mirrors EnterWifiConfigMode).
+    ESP_LOGW(TAG, "WiFi connection timeout, rebooting into BLE provisioning");
+    SsidManager::GetInstance().Clear();
+    board->GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+#else
     ESP_LOGW(TAG, "WiFi connection timeout, entering config mode");
-
     WifiManager::GetInstance().StopStation();
     board->StartWifiConfigMode();
+#endif
 }
 
 void WifiBoard::StartWifiConfigMode() {

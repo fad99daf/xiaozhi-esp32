@@ -1004,7 +1004,7 @@ config TUYA_BLE_PROVISIONING
     depends on PROTOCOL_TUYA
     help
         First-boot WiFi provisioning via Tuya BLE pairing.
-        Falls back to SoftAP if BLE pairing times out (60s).
+        Retries BLE pairing until it succeeds; there is no SoftAP fallback.
         Requires NimBLE.
 
 endmenu
