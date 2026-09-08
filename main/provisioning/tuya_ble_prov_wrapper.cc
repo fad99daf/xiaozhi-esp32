@@ -2,7 +2,7 @@
 
 #if CONFIG_TUYA_BLE_PROVISIONING
 
-#include "tuya_authkey.h"
+#include "tuya_auth.h"
 
 extern "C" {
 #include "tuya_ble_nimble.h"
@@ -55,11 +55,21 @@ bool TuyaBleProvision(int timeout_ms, BleProvResult& result)
 
     s_result = {};
 
+    // tuya_ble_prov_cfg_t keeps const char* pointers for the whole
+    // provisioning session, so the credentials must outlive TuyaBleProvision.
+    static TuyaAuthCredentials auth;
+    if (!TuyaAuthLoad(auth)) {
+        ESP_LOGE(TAG, "Device identity unavailable - flash it with: idf.py tuya-auth-flash");
+        vEventGroupDelete(s_event_group);
+        s_event_group = nullptr;
+        return false;
+    }
+
     tuya_ble_prov_cfg_t cfg = {};
     cfg.device_name = "TUYA";
-    cfg.product_key = TUYA_PRODUCT_KEY;
-    cfg.uuid = TUYA_UUID;
-    cfg.auth_key = TUYA_AUTH_KEY;
+    cfg.product_key = auth.product_key;
+    cfg.uuid = auth.uuid;
+    cfg.auth_key = auth.auth_key;
     cfg.cb = ble_prov_callback;
 
     int rc = tuya_ble_nimble_start(&cfg);

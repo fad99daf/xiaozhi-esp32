@@ -82,6 +82,30 @@ jobs:
             fi
           fi
 
+  tuya-auth-tests:
+    name: Tuya auth host tests
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Run host test suite
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          python -m unittest discover -s tests -p 'test_tuya_auth*.py' -v
+
+      - name: Check idf.py tuya-auth actions register
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          idf.py tuya-auth-flash --help
+          idf.py tuya-auth-read --help
+
   build:
     name: Build ${{ matrix.full_name }}
     needs: prepare

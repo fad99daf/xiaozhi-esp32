@@ -52,7 +52,9 @@ git submodule update --init --recursive
 
 ### 1. 配置授权码信息
 
-在项目根目录创建 `tuya_authkey.txt` 文件, 填入你的产品 PID 和授权码:
+设备授权码存储在设备的 `nvs` 分区中 (命名空间 `tuya_auth`), 固件运行时从 NVS 读取, 没有编译期内置的授权码。
+
+在主机上准备一个 KEY=VALUE 格式的授权码文件 (默认路径为项目根目录的 `tuya_authkey.txt`):
 
 ```
 TUYA_UUID=your_uuid_here
@@ -60,9 +62,17 @@ TUYA_AUTH_KEY=your_authkey_here
 TUYA_PRODUCT_KEY=your_product_pid_here
 ```
 
-构建系统会自动读取此文件并生成 `tuya_authkey.h` 头文件, 供 BLE 配网和设备激活使用。
+烧录固件后, 关闭串口监视器, 将授权码写入设备:
+
+```sh
+idf.py -p PORT tuya-auth-flash          # 写入并自动回读校验
+idf.py -p PORT tuya-auth-read           # 查看设备上已存储的授权码
+```
+
+> ⚠️ `tuya-auth-flash` 会**整片重写 `nvs` 分区**: WiFi 配置、设备设置和已激活的云端凭据都会被擦除, 烧录后需要重新用 Tuya App 配网激活（配网会一并恢复 WiFi 和激活状态）。
 
 > ⚠️ 此文件包含设备凭据, 请勿提交到公开仓库。建议将其加入 `.gitignore`。
+
 
 ### 2. menuconfig 配置
 

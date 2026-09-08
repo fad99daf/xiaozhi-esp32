@@ -1,5 +1,5 @@
 #include "tuya_protocol.h"
-#include "tuya_authkey.h"
+#include "tuya_auth.h"
 #include "settings.h"
 #include <cstring>
 #include <cstdlib>
@@ -178,10 +178,16 @@ bool TuyaProtocol::OnBoardWithToken(const std::string& token) {
 
     EnsureSdkInitialized();
 
+    TuyaAuthCredentials auth;
+    if (!TuyaAuthLoad(auth)) {
+        ESP_LOGE(TAG, "Device identity unavailable for on-boarding");
+        return false;
+    }
+
     iot_on_boarding_config_t cfg = {};
-    memcpy((char*)cfg.uuid, TUYA_UUID, strlen(TUYA_UUID));
-    memcpy((char*)cfg.authkey, TUYA_AUTH_KEY, strlen(TUYA_AUTH_KEY));
-    memcpy((char*)cfg.product_key, TUYA_PRODUCT_KEY, strlen(TUYA_PRODUCT_KEY));
+    memcpy((char*)cfg.uuid, auth.uuid, sizeof(cfg.uuid));
+    memcpy((char*)cfg.authkey, auth.auth_key, sizeof(cfg.authkey));
+    memcpy((char*)cfg.product_key, auth.product_key, sizeof(cfg.product_key));
     cfg.timeout_ms = 30000;
     cfg.env = PROD;
     cfg.mqtt_disable_tls = false;

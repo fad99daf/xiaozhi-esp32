@@ -35,6 +35,7 @@ set(SOURCES "audio/audio_codec.cc"
             "application.cc"
             "ota.cc"
             "settings.cc"
+            "tuya_auth.cc"
             "device_state_machine.cc"
             "assets.cc"
             "main.cc"
@@ -63,35 +64,6 @@ list(APPEND SOURCES
     "boards/common/system_reset.cc"
 )
 list(APPEND INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boards/common)
-
-# Generate tuya_authkey.h from tuya_authkey.txt when the Tuya protocol is selected
-if(CONFIG_PROTOCOL_TUYA)
-    set(_TUYA_AUTHKEY_TXT "${PROJECT_DIR}/tuya_authkey.txt")
-    if(NOT EXISTS "${_TUYA_AUTHKEY_TXT}")
-        message(FATAL_ERROR "PROTOCOL_TUYA enabled but ${_TUYA_AUTHKEY_TXT} not found")
-    endif()
-    file(STRINGS "${_TUYA_AUTHKEY_TXT}" _ak_lines)
-    foreach(_line ${_ak_lines})
-        if(_line MATCHES "^TUYA_UUID=(.+)$")
-            set(_TUYA_UUID "${CMAKE_MATCH_1}")
-        elseif(_line MATCHES "^TUYA_AUTH_KEY=(.+)$")
-            set(_TUYA_AUTH_KEY "${CMAKE_MATCH_1}")
-        elseif(_line MATCHES "^TUYA_PRODUCT_KEY=(.+)$")
-            set(_TUYA_PRODUCT_KEY "${CMAKE_MATCH_1}")
-        endif()
-    endforeach()
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/tuya_authkey.h"
-        "#ifndef TUYA_AUTHKEY_H\n"
-        "#define TUYA_AUTHKEY_H\n"
-        "\n"
-        "#define TUYA_UUID        \"${_TUYA_UUID}\"\n"
-        "#define TUYA_AUTH_KEY    \"${_TUYA_AUTH_KEY}\"\n"
-        "#define TUYA_PRODUCT_KEY \"${_TUYA_PRODUCT_KEY}\"\n"
-        "\n"
-        "#endif\n"
-    )
-    list(APPEND INCLUDE_DIRS "${CMAKE_CURRENT_BINARY_DIR}")
-endif()
 
 
 idf_build_get_property(build_components BUILD_COMPONENTS)
