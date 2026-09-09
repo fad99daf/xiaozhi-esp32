@@ -74,6 +74,7 @@ private:
     std::mutex send_mutex_;
     std::atomic<bool> connected_{false};
     std::atomic<bool> session_active_{false};
+    std::atomic<bool> disconnect_cleanup_pending_{false};
     bool is_first_audio_packet_ = true;
     bool has_received_first_nlg_ = false;
     std::atomic<bool> audio_end_pending_{false};

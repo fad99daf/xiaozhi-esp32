@@ -661,11 +661,12 @@ bool TuyaProtocol::OpenAudioChannel() {
 }
 
 void TuyaProtocol::CloseAudioChannel(bool send_goodbye) {
-    if (!session_active_) return;
+    if (!session_active_ && !disconnect_cleanup_pending_) return;
 
     tai_disconnect(ctx_);
     connected_ = false;
     session_active_ = false;
+    disconnect_cleanup_pending_ = false;
 
     // Session is gone — drop any unsent batched frames.
     {
@@ -1029,6 +1030,15 @@ void TuyaProtocol::HandleDisconnect(uint8_t reason, uint8_t detail,
                  disconnect_reason_name(reason), disconnect_detail_name(reason, detail),
                  close_code, connection_alive);
     }
+    if (disconnect_cleanup_pending_.exchange(true)) return;
+
+    // This callback is invoked by the TAI receive thread. tai_disconnect()
+    // must run elsewhere because it joins that thread and releases its TLS
+    // buffers before a reconnect can allocate another session.
+    Application::GetInstance().Schedule([this]() {
+        CloseAudioChannel(false);
+    });
+
     if (on_network_error_) {
         on_network_error_("Tuya AI connection lost");
     }
