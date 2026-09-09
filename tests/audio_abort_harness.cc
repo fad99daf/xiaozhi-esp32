@@ -18,6 +18,7 @@ constexpr int MAX_PLAYBACK_TASKS_IN_QUEUE=2, MAX_SEND_PACKETS_IN_QUEUE=60;
 constexpr int MAX_DECODE_PACKETS_IN_QUEUE=2, OPUS_FRAME_DURATION_MS=40;
 constexpr int AUDIO_POWER_CHECK_INTERVAL_MS=1000;
 constexpr int ESP_AUDIO_ERR_OK=0, ESP_AUDIO_ERR_BUFF_NOT_ENOUGH=1, ESP_AUDIO_DEC_RECOVERY_NONE=0;
+constexpr int ESP_AE_ERR_OK=0;
 std::function<void()> resample_hook, enable_hook, packet_destroy_hook, output_hook;
 std::promise<void>* full_queue = nullptr;
 // A real condition_variable with a deterministic signal when a producer waits.
@@ -48,7 +49,7 @@ struct esp_audio_dec_info_t {};
 int esp_opus_dec_decode(void*, esp_audio_dec_in_raw_t*, esp_audio_dec_out_frame_t* out, esp_audio_dec_info_t*) { out->decoded_size=2; return 0; }
 using esp_ae_sample_t = void*;
 void esp_ae_rate_cvt_get_max_out_sample_num(void*, size_t, uint32_t* count) { *count=1; }
-void esp_ae_rate_cvt_process(void*, void*, size_t, void*, uint32_t*) { if(resample_hook) resample_hook(); }
+int esp_ae_rate_cvt_process(void*, void*, size_t, void*, uint32_t* count) { *count=1; if(resample_hook) resample_hook(); return ESP_AE_ERR_OK; }
 struct esp_audio_enc_in_frame_t { uint8_t* buffer; uint32_t len; };
 struct esp_audio_enc_out_frame_t { uint8_t* buffer; uint32_t len,encoded_bytes; };
 int esp_opus_enc_process(void*, esp_audio_enc_in_frame_t*, esp_audio_enc_out_frame_t*) { return -1; }

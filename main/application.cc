@@ -1,5 +1,6 @@
 #include "application.h"
 #include "board.h"
+#include "boards/common/wifi_board.h"
 #include "display.h"
 #include "system_info.h"
 #include "audio_codec.h"
@@ -221,6 +222,10 @@ void Application::Run() {
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
+                    audio_service_.FlushAudioQueues();
+                    protocol_->CloseAudioChannel(false);
+                    last_error_message_ = "Tuya AI connection lost";
+                    xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
                     break;
                 }
             }
@@ -332,7 +337,15 @@ void Application::ActivationTask() {
     CheckNewVersion();
 
     // Initialize the protocol
-    InitializeProtocol();
+    if (!InitializeProtocol()) {
+#if CONFIG_TUYA_BLE_PROVISIONING
+        ESP_LOGW(TAG, "Tuya activation is required; entering BLE provisioning");
+        if (auto* wifi_board = dynamic_cast<WifiBoard*>(&Board::GetInstance())) {
+            wifi_board->EnterWifiConfigMode();
+        }
+#endif
+        return;
+    }
 
     // Signal completion to main loop
     xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
@@ -502,7 +515,7 @@ void Application::CheckNewVersion() {
 #endif
 }
 
-void Application::InitializeProtocol() {
+bool Application::InitializeProtocol() {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
     auto codec = board.GetAudioCodec();
@@ -529,6 +542,7 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnNetworkError([this](const std::string& message) {
+        audio_service_.FlushAudioQueues();
         last_error_message_ = message;
         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
     });
@@ -676,7 +690,7 @@ void Application::InitializeProtocol() {
         }
     });
     
-    protocol_->Start();
+    return protocol_->Start();
 }
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {

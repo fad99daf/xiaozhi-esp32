@@ -425,12 +425,25 @@ void AudioService::OpusCodecTask() {
                 if (ret == ESP_AUDIO_ERR_OK) {
                     task->pcm.resize(out_frame.decoded_size / sizeof(int16_t));
                     if (decoder_sample_rate_ != codec_->output_sample_rate() && output_resampler_ != nullptr) {
+                        const uint32_t input_samples = task->pcm.size();
+                        const uint32_t output_sample_rate = codec_->output_sample_rate();
                         uint32_t target_size = 0;
-                        esp_ae_rate_cvt_get_max_out_sample_num(output_resampler_, task->pcm.size(), &target_size);
-                        std::vector<int16_t> resampled(target_size);
-                        uint32_t actual_output = target_size;
-                        esp_ae_rate_cvt_process(output_resampler_, (esp_ae_sample_t)task->pcm.data(), task->pcm.size(),
-                                                (esp_ae_sample_t)resampled.data(), &actual_output);
+                        esp_ae_rate_cvt_get_max_out_sample_num(output_resampler_, input_samples, &target_size);
+                        uint32_t resample_capacity =
+                            (uint64_t(decoder_frame_size_) * output_sample_rate + decoder_sample_rate_ - 1) /
+                            decoder_sample_rate_ + 128;
+                        if (target_size > resample_capacity) {
+                            resample_capacity = target_size;
+                        }
+                        std::vector<int16_t> resampled(resample_capacity);
+                        uint32_t actual_output = resampled.size();
+                        auto resampler_ret = esp_ae_rate_cvt_process(output_resampler_, (esp_ae_sample_t)task->pcm.data(), input_samples,
+                                                                     (esp_ae_sample_t)resampled.data(), &actual_output);
+                        if (resampler_ret != ESP_AE_ERR_OK || actual_output > resampled.size()) {
+                            ESP_LOGE(TAG, "Failed to resample audio: %d (output=%u, capacity=%u)",
+                                     resampler_ret, actual_output, (unsigned)resampled.size());
+                            continue;
+                        }
                         resampled.resize(actual_output);
                         task->pcm = std::move(resampled);
                     }
@@ -770,13 +783,16 @@ void AudioService::ResetDecoder() {
 
 void AudioService::FlushAudioQueues() {
     // Like ResetDecoder but without clearing decoder state or setting
-    // output_aborted_ — just drains the queues.  Used for normal state
-    // transitions where we want fresh queues but not an abort signal.
+    // output_aborted_ — just drains the queues. Used for a lost transport so
+    // stale microphone frames are never sent after the next reconnect.
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     ++output_generation_;
+    audio_encode_queue_.clear();
+    audio_send_queue_.clear();
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
     audio_testing_queue_.clear();
+    timestamp_queue_.clear();
     audio_queue_cv_.notify_all();
 }
 

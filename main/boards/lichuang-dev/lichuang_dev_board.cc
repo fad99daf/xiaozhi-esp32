@@ -72,6 +72,24 @@ private:
     Display* display_;
     Pca9557* pca9557_;
     Esp32Camera* camera_;
+    esp_lcd_touch_handle_t touch_ = nullptr;
+
+    static void TouchInputReadCallback(lv_indev_t* indev, lv_indev_data_t* data) {
+        auto* touch = static_cast<esp_lcd_touch_handle_t>(lv_indev_get_user_data(indev));
+        esp_lcd_touch_point_data_t point = {};
+        uint8_t point_count = 0;
+
+        if (esp_lcd_touch_read_data(touch) != ESP_OK ||
+            esp_lcd_touch_get_data(touch, &point, &point_count, 1) != ESP_OK ||
+            point_count == 0) {
+            data->state = LV_INDEV_STATE_RELEASED;
+            return;
+        }
+
+        data->point.x = point.x;
+        data->point.y = point.y;
+        data->state = LV_INDEV_STATE_PRESSED;
+    }
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -167,7 +185,6 @@ private:
 
     void InitializeTouch()
     {
-        esp_lcd_touch_handle_t tp;
         esp_lcd_touch_config_t tp_cfg = {
             .x_max = DISPLAY_HEIGHT,
             .y_max = DISPLAY_WIDTH,
@@ -197,20 +214,14 @@ private:
         tp_io_config.scl_speed_hz = 400000;
 
         esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle);
-        esp_lcd_touch_new_i2c_ft5x06(tp_io_handle, &tp_cfg, &tp);
-        assert(tp);
+        esp_lcd_touch_new_i2c_ft5x06(tp_io_handle, &tp_cfg, &touch_);
+        assert(touch_);
 
-        /* Add touch input (for selected screen) */
-        const lvgl_port_touch_cfg_t touch_cfg = {
-            .disp = lv_display_get_default(), 
-            .handle = tp,
-        };
-
-        if(touch_cfg.disp) {
-            lvgl_port_add_touch(&touch_cfg);
-        } else {
-            ESP_LOGE(TAG, "Touch display is not initialized");
-        }
+        auto* touch_indev = lv_indev_create();
+        lv_indev_set_type(touch_indev, LV_INDEV_TYPE_POINTER);
+        lv_indev_set_read_cb(touch_indev, TouchInputReadCallback);
+        lv_indev_set_disp(touch_indev, lv_display_get_default());
+        lv_indev_set_user_data(touch_indev, touch_);
     }
 
     void InitializeCamera() {

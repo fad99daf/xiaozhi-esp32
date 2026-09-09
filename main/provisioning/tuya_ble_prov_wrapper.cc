@@ -79,11 +79,11 @@ bool TuyaBleProvision(int timeout_ms, BleProvResult& result)
         return false;
     }
 
-    ESP_LOGI(TAG, "BLE advertising started, waiting %d ms...", timeout_ms);
+    ESP_LOGI(TAG, "BLE advertising started%s", timeout_ms < 0 ? ", waiting for credentials..." : "...");
     EventBits_t bits = xEventGroupWaitBits(
         s_event_group, BLE_PROV_DONE_BIT,
         pdTRUE, pdTRUE,
-        pdMS_TO_TICKS(timeout_ms));
+        timeout_ms < 0 ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms));
 
     tuya_ble_nimble_stop();
     ble_full_deinit();

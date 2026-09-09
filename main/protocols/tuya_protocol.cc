@@ -479,8 +479,10 @@ bool TuyaProtocol::BuildTaiContext() {
     }
 
     tai_config_t cfg = {};
-    cfg.host = conn_params_.host;
-    cfg.port = conn_params_.port;
+    //cfg.host = conn_params_.host;
+    //cfg.port = conn_params_.port;
+    cfg.host="172.16.122.98";
+    cfg.port=443;
     cfg.tls_sni = conn_params_.tls_sni;
     cfg.device_id = conn_params_.derived_client_id;
     cfg.local_key = local_key_.c_str();
@@ -490,7 +492,7 @@ bool TuyaProtocol::BuildTaiContext() {
     cfg.biz_tag = (uint64_t)conn_params_.biz_tag;
     cfg.sign_level = TAI_SIGN_HMAC_SHA256;
     cfg.agent_token = conn_params_.agent_token;
-    cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
+    //cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
     cfg.pal = tai_pal_freertos();
 
     cfg.session_attrs_json =
