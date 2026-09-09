@@ -68,13 +68,16 @@ struct AudioService {
     void *opus_decoder_=(void*)1, *opus_encoder_=nullptr, *output_resampler_=(void*)1;
     int decoder_frame_size_=1, decoder_sample_rate_=16000, encoder_frame_size_=1, encoder_outbuf_size_=1;
     int audio_power_timer_=0;
+    std::vector<int16_t> resample_buffer_;
     std::chrono::steady_clock::time_point last_output_time_;
     struct { int playback_count=0,decode_count=0,encode_count=0; } debug_statistics_;
     struct { std::function<void()> on_send_queue_available; } callbacks_;
     void SetDecodeSampleRate(int,int) {}
     void AbortOutput(); void ResetDecoder(); void FlushAudioQueues();
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket>, bool);
-    void AudioOutputTask(); void OpusCodecTask();
+    void AudioOutputTask(); void OpusCodecTask(); void OpusCodecLoop();
+    void ProcessDecodePacket(std::unique_ptr<DecodeAudioPacket>, uint32_t);
+    void ProcessEncodeTask(std::unique_ptr<AudioTask>);
     void stop() { std::lock_guard<std::mutex> lock(audio_queue_mutex_); service_stopped_=true; audio_queue_cv_.notify_all(); }
 };
 // AUDIO_SERVICE_METHODS
@@ -130,6 +133,28 @@ int main() {
         auto producer=std::async(std::launch::async,[&]{return service.PushPacketToDecodeQueue(std::make_unique<AudioStreamPacket>(),true);});
         waiting.get_future().wait();service.AbortOutput();service.ResetDecoder();
         assert(!producer.get());assert(service.audio_decode_queue_.empty());
+    }
+    // A burst larger than capacity must wait and resume without losing order.
+    {
+        AudioService service;
+        std::promise<void> waiting; full_queue = &waiting;
+        auto producer = std::async(std::launch::async, [&] {
+            for (int i = 0; i < 100; ++i) {
+                auto packet = std::make_unique<AudioStreamPacket>();
+                packet->timestamp = i;
+                assert(service.PushPacketToDecodeQueue(std::move(packet), true));
+            }
+        });
+        waiting.get_future().wait();
+        for (int i = 0; i < 100; ++i) {
+            std::unique_lock<std::mutex> lock(service.audio_queue_mutex_);
+            service.audio_queue_cv_.wait(lock, [&] { return !service.audio_decode_queue_.empty(); });
+            assert(service.audio_decode_queue_.size() <= MAX_DECODE_PACKETS_IN_QUEUE);
+            assert(service.audio_decode_queue_.front()->timestamp == (uint32_t)i);
+            service.audio_decode_queue_.pop_front();
+            service.audio_queue_cv_.notify_all();
+        }
+        producer.get();
     }
     // A subsequent generation must still play normally after abort/reset.
     {

@@ -1033,9 +1033,9 @@ idf_component_register(SRCS ${SOURCES}
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 
-# TAI buffer sizes: upstream defaults (~37 KB total context) are ESP32-friendly;
-# no overrides needed. Previous overrides referenced symbols removed by the
-# scatter-gather TX redesign and conflicted with non-guarded #define guards.
+# TAI buffer sizes: C3-class targets override TAI_MAX_FRAGMENT_PAYLOAD and
+# TAI_FRAG_BUF_SIZE at project level (root CMakeLists.txt) so both main and
+# esp-agentic-kit see the same struct tai_ctx layout.
 
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
 # If BOARD_NAME is empty, use BOARD_TYPE

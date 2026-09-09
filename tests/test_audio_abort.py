@@ -24,7 +24,8 @@ class AudioAbortTests(unittest.TestCase):
         source = (ROOT / 'main/audio/audio_service.cc').read_text()
         methods = '\n'.join(method(source, 'AudioService::' + name + '(') for name in (
             'AbortOutput', 'ResetDecoder', 'FlushAudioQueues', 'PushPacketToDecodeQueue',
-            'AudioOutputTask', 'OpusCodecTask'))
+            'AudioOutputTask', 'OpusCodecTask', 'OpusCodecLoop',
+            'ProcessDecodePacket', 'ProcessEncodeTask'))
         harness = (ROOT / 'tests/audio_abort_harness.cc').read_text()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)

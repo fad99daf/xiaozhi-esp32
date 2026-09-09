@@ -39,10 +39,19 @@
  */
 
 #define OPUS_FRAME_DURATION_MS 40
+#if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6
+// C3-class chips have ~120 KB SRAM shared with WiFi/BLE/LVGL; the upstream
+// worst-case sizes exhaust the heap. Tuya TTS sends 60 ms Opus frames.
+// Decode-queue entries hold compressed Opus (~600 B avg each), so 32 entries
+// cost ~19 KB worst case (~2 KB typical) — about 1.3 s of audio buffer.
+#define OPUS_MAX_FRAME_DURATION_MS 60
+#define MAX_DECODE_PACKETS_IN_QUEUE 32
+#else
 #define OPUS_MAX_FRAME_DURATION_MS 120
+#define MAX_DECODE_PACKETS_IN_QUEUE (48000 / OPUS_FRAME_DURATION_MS)
+#endif
 #define MAX_ENCODE_TASKS_IN_QUEUE 2
 #define MAX_PLAYBACK_TASKS_IN_QUEUE 2
-#define MAX_DECODE_PACKETS_IN_QUEUE (48000 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
 #define MAX_TIMESTAMPS_IN_QUEUE 3
@@ -174,6 +183,9 @@ public:
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
+    // True when the decode queue is at/above the high-water mark used for
+    // TCP-level flow control (TAI worker stops reading, lwIP window closes).
+    bool IsDecodeQueueBackpressured() const;
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
@@ -183,6 +195,13 @@ public:
     void FlushAudioQueues();
 
 private:
+    // High-water mark for TCP flow control. Half the hard MAX: on no-PSRAM
+    // targets the window must close early so enough internal heap stays free
+    // for the coexisting MQTT TLS write (a ~4.4 KB alloc that failed and tore
+    // down the broker link when the queue ran near-full). Reopens with
+    // hysteresis room once frames drain.
+    static constexpr size_t kDecodeQueueHighWater = MAX_DECODE_PACKETS_IN_QUEUE / 2;
+
     AudioCodec* codec_ = nullptr;
     AudioServiceCallbacks callbacks_;
     std::unique_ptr<AudioProcessor> audio_processor_;
@@ -212,7 +231,7 @@ private:
     TaskHandle_t audio_input_task_handle_ = nullptr;
     TaskHandle_t audio_output_task_handle_ = nullptr;
     TaskHandle_t opus_codec_task_handle_ = nullptr;
-    std::mutex audio_queue_mutex_;
+    mutable std::mutex audio_queue_mutex_;
     std::condition_variable audio_queue_cv_;
     std::deque<std::unique_ptr<DecodeAudioPacket>> audio_decode_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_send_queue_;
@@ -236,9 +255,17 @@ private:
     std::chrono::steady_clock::time_point last_input_time_;
     std::chrono::steady_clock::time_point last_output_time_;
 
+    // Reusable resample scratch buffer (avoids a per-frame multi-KB heap alloc
+    // that systematically failed with bad_alloc on no-PSRAM targets, since the
+    // output resampler is always active when server rate != codec rate).
+    std::vector<int16_t> resample_buffer_;
+
     void AudioInputTask();
     void AudioOutputTask();
     void OpusCodecTask();
+    void OpusCodecLoop();
+    void ProcessDecodePacket(std::unique_ptr<DecodeAudioPacket> packet, uint32_t generation);
+    void ProcessEncodeTask(std::unique_ptr<AudioTask> task);
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void CheckAndUpdateAudioPowerState();

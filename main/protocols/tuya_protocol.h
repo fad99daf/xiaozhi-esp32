@@ -108,6 +108,7 @@ private:
                           void* user);
     static void OnDisconnectCb(tai_ctx_t* ctx, const tai_disconnect_msg_t* msg,
                                void* user);
+    static int OnFlowControlCb(tai_ctx_t* ctx, void* user);
 
     void HandleAudio(const uint8_t* data, size_t len,
                      uint32_t sample_rate, uint16_t frame_duration);

@@ -549,10 +549,17 @@ bool Application::InitializeProtocol() {
     
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         if (GetDeviceState() == kDeviceStateSpeaking && !aborted_) {
-            // Non-blocking: the TAI receive thread must never block here, otherwise
-            // CHAT_BREAK events cannot be delivered for barge-in.
-            // The decode queue is sized large enough (24s) to absorb server bursts.
-            if (!audio_service_.PushPacketToDecodeQueue(std::move(packet), false)) {
+            // Small-RAM Tuya targets already use TCP backpressure. One received
+            // message can expand into more Opus frames than the queue can hold,
+            // so wait for playback to drain within that message as well. Abort,
+            // reset and stop cancel the wait. Larger queues remain non-blocking
+            // to keep incoming barge-in events responsive.
+#if CONFIG_PROTOCOL_TUYA && (CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6)
+            constexpr bool wait_for_decode = true;
+#else
+            constexpr bool wait_for_decode = false;
+#endif
+            if (!audio_service_.PushPacketToDecodeQueue(std::move(packet), wait_for_decode)) {
                 static int overflow_count = 0;
                 if (++overflow_count % 50 == 1) {
                     ESP_LOGW(TAG, "[BARGE-IN] Decode queue overflow, dropping packet (count=%d)", overflow_count);
@@ -1217,4 +1224,3 @@ void Application::ResetProtocol() {
         protocol_.reset();
     });
 }
-

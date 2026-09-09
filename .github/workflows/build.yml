@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Audio abort regression (ASan and UBSan)
-        run: python3 -m unittest discover -s tests -p 'test_audio_abort.py' -v
+      - name: Audio regressions (ASan and UBSan)
+        run: python3 -m unittest discover -s tests -p 'test_audio*.py' -v
 
   prepare:
     name: Determine variants to build

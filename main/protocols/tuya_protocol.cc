@@ -251,9 +251,17 @@ void TuyaProtocol::OnCloudReset(iot_reset_type_t type, void* user) {
 bool TuyaProtocol::StartMqttPump() {
     if (mqtt_pump_running_.exchange(true)) return true;
 
+#if CONFIG_SPIRAM
     constexpr size_t kMqttPumpStackWords = 6144;
+#else
+    constexpr size_t kMqttPumpStackWords = 4096;  // 16 KB; internal RAM on C3
+#endif
     mqtt_pump_stack_ = static_cast<StackType_t*>(
         heap_caps_malloc(kMqttPumpStackWords * sizeof(StackType_t), MALLOC_CAP_SPIRAM));
+    if (!mqtt_pump_stack_) {  // no PSRAM: fall back to internal RAM
+        mqtt_pump_stack_ = static_cast<StackType_t*>(
+            heap_caps_malloc(kMqttPumpStackWords * sizeof(StackType_t), MALLOC_CAP_INTERNAL));
+    }
     mqtt_pump_task_buffer_ = static_cast<StaticTask_t*>(
         heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL));
     mqtt_pump_done_ = xSemaphoreCreateBinaryStatic(&mqtt_pump_done_buffer_);
@@ -393,7 +401,7 @@ bool TuyaProtocol::FetchToken() {
 }
 
 bool TuyaProtocol::ParseToken() {
-    memset(&conn_params_, 0, sizeof(conn_params_));
+    conn_params_ = ConnParams{};
 
     // Try base64 decode
     char *json = nullptr;
@@ -473,8 +481,11 @@ bool TuyaProtocol::BuildTaiContext() {
     // The context size is printed below; after the scatter-gather redesign
     // it is ~37 KB. PSRAM is safe (no ISR/cache-disabled access).
     ctx_mem_ = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ctx_mem_) {  // no PSRAM (C3-class): fall back to internal RAM
+        ctx_mem_ = heap_caps_malloc(sz, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
     if (!ctx_mem_) {
-        ESP_LOGE(TAG, "Failed to allocate %u bytes for TAI context in PSRAM", (unsigned)sz);
+        ESP_LOGE(TAG, "Failed to allocate %u bytes for TAI context", (unsigned)sz);
         return false;
     }
 
@@ -508,6 +519,7 @@ bool TuyaProtocol::BuildTaiContext() {
     cfg.on_text = OnTextCb;
     cfg.on_event = OnEventCb;
     cfg.on_disconnect = OnDisconnectCb;
+    cfg.on_flow_control = OnFlowControlCb;
     cfg.user_data = this;
 
     ctx_ = tai_ctx_init(ctx_mem_, &cfg);
@@ -819,6 +831,17 @@ void TuyaProtocol::OnDisconnectCb(tai_ctx_t* ctx,
                            msg->connection_alive);
 }
 
+// Called on the TAI worker thread before each blocking recv. Returning 0 makes
+// the worker skip the socket read, so lwIP's receive buffer stays full and the
+// advertised TCP window closes — standard TCP backpressure to the server. While
+// stalled, inbound control frames (CHAT_BREAK) are also blocked; we accept that
+// because a full decode queue means we're already behind on playback.
+int TuyaProtocol::OnFlowControlCb(tai_ctx_t* ctx, void* user) {
+    (void)ctx; (void)user;
+    return Application::GetInstance().GetAudioService()
+                      .IsDecodeQueueBackpressured() ? 0 : 1;
+}
+
 void TuyaProtocol::HandleAudio(const uint8_t* data, size_t len,
                                 uint32_t sample_rate, uint16_t frame_duration) {
     audio_recv_count_++;
@@ -844,25 +867,21 @@ void TuyaProtocol::HandleAudio(const uint8_t* data, size_t len,
     // TCP chunking may split frames across packets, so we reassemble here.
     const size_t frame_size = TAI_OPUS_FRAME_SIZE_BYTES;
 
-    // Append incoming data to reassembly buffer
-    audio_reassembly_buf_.insert(audio_reassembly_buf_.end(), data, data + len);
-
-    // Extract complete frames
+    // Keep at most one Opus frame. Copying the whole network message retained
+    // its peak capacity (up to the fragment buffer size) for the entire session.
     size_t offset = 0;
-    while (offset + frame_size <= audio_reassembly_buf_.size()) {
+    while (offset < len) {
+        const size_t remaining = frame_size - audio_reassembly_buf_.size();
+        const size_t count = (len - offset < remaining) ? len - offset : remaining;
+        audio_reassembly_buf_.insert(audio_reassembly_buf_.end(), data + offset, data + offset + count);
+        offset += count;
+        if (audio_reassembly_buf_.size() < frame_size) break;
         auto pkt = std::make_unique<AudioStreamPacket>();
-        pkt->payload.assign(audio_reassembly_buf_.begin() + offset,
-                            audio_reassembly_buf_.begin() + offset + frame_size);
+        pkt->payload.assign(audio_reassembly_buf_.begin(), audio_reassembly_buf_.end());
         pkt->sample_rate = server_sample_rate_;
         pkt->frame_duration = server_frame_duration_;
+        audio_reassembly_buf_.clear();
         on_incoming_audio_(std::move(pkt));
-        offset += frame_size;
-    }
-
-    // Keep leftover bytes for next packet
-    if (offset > 0) {
-        audio_reassembly_buf_.erase(audio_reassembly_buf_.begin(),
-                                    audio_reassembly_buf_.begin() + offset);
     }
 }
 

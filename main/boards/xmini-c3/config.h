@@ -3,8 +3,15 @@
 
 #include <driver/gpio.h>
 
+#if CONFIG_PROTOCOL_TUYA
+// Match Tuya's 16 kHz voice stream to avoid two resamplers and their SRAM
+// buffers on C3, leaving headroom for TLS/AES and bursty network traffic.
+#define AUDIO_INPUT_SAMPLE_RATE  16000
+#define AUDIO_OUTPUT_SAMPLE_RATE 16000
+#else
 #define AUDIO_INPUT_SAMPLE_RATE  24000
 #define AUDIO_OUTPUT_SAMPLE_RATE 24000
+#endif
 
 #define AUDIO_I2S_GPIO_MCLK GPIO_NUM_10
 #define AUDIO_I2S_GPIO_WS GPIO_NUM_6
