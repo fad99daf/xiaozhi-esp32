@@ -16,8 +16,12 @@
 
 ### 1. 环境准备
 
-* **ESP-IDF >= 5.5** — 安装及配置方法参考 [ESP-IDF 编程指南](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32s3/get-started/)
+* **ESP-IDF = 5.5.2** — 安装及配置方法参考 [ESP-IDF 编程指南](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32s3/get-started/)
 * 确认 `idf.py` 可正常使用
+
+注:  理论上ESP-IDF的5.5.x开始到6之前的版本都可以编译, 但不同小版本之间会有一些不同
+的默认选项, 可能会影响**内存的占用情况**. 建议在选用不同小版本时,查看版本的默认选项差异并进行调整.
+
 
 ### 2. Tuya IoT 平台准备
 
