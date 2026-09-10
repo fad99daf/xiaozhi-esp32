@@ -7,6 +7,9 @@
 extern "C" {
 #include "tuya_ble_nimble.h"
 #include "esp_bt.h"
+#include "iot_client.h"
+#include "log.h"
+extern const pal_t *tai_pal_freertos(void);
 }
 
 #include <freertos/FreeRTOS.h>
@@ -19,6 +22,21 @@ extern "C" {
 
 static EventGroupHandle_t s_event_group;
 static BleProvResult s_result;
+
+// Route the agentic-kit log facade to ESP_LOG so the BLE layer's internal
+// [ble] debug lines (adv payload, RX frames, rejection reasons) are visible
+// on the serial console during pairing.
+static void ble_sdk_log_cb(log_level_t level, const char *fmt, va_list args)
+{
+    char buf[256];
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    switch (level) {
+        case LOG_ERROR: ESP_LOGE("tuya_sdk", "%s", buf); break;
+        case LOG_WARN:  ESP_LOGW("tuya_sdk", "%s", buf); break;
+        case LOG_INFO:  ESP_LOGI("tuya_sdk", "%s", buf); break;
+        default:        ESP_LOGD("tuya_sdk", "%s", buf); break;
+    }
+}
 
 static void ble_prov_callback(const tuya_ble_wifi_creds_t *creds)
 {
@@ -63,6 +81,21 @@ bool TuyaBleProvision(int timeout_ms, BleProvResult& result)
         vEventGroupDelete(s_event_group);
         s_event_group = nullptr;
         return false;
+    }
+
+    // The BLE layer uses the SDK's cJSON hooks (installed by iot_init) for
+    // building the WiFi-list JSON. Must run before tuya_ble_nimble_start.
+    static bool sdk_initialized = false;
+    if (!sdk_initialized) {
+        log_set_handler(ble_sdk_log_cb);
+        log_set_level(LOG_DEBUG);
+        if (iot_init(tai_pal_freertos()) != 0) {
+            ESP_LOGE(TAG, "iot_init failed");
+            vEventGroupDelete(s_event_group);
+            s_event_group = nullptr;
+            return false;
+        }
+        sdk_initialized = true;
     }
 
     tuya_ble_prov_cfg_t cfg = {};
