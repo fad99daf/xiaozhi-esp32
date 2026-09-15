@@ -23,11 +23,22 @@ extern const pal_t *tai_pal_freertos(void);
 static EventGroupHandle_t s_event_group;
 static BleProvResult s_result;
 
-// Route the agentic-kit log facade to ESP_LOG so the BLE layer's internal
-// [ble] debug lines (adv payload, RX frames, rejection reasons) are visible
-// on the serial console during pairing.
+// Keep BLE protocol traces visible in INFO builds without enabling SDK-wide
+// debug output. SDK hex dumps and WiFi JSON can contain pairing secrets.
 static void ble_sdk_log_cb(log_level_t level, const char *fmt, va_list args)
 {
+    if (strncmp(fmt, "[ble] HEX(", 10) == 0) return;
+    if (strcmp(fmt, "[ble] [PROTO] WiFi JSON: %s") == 0) {
+        ESP_LOGI("tuya_sdk", "[ble] [PROTO] WiFi JSON received (contents redacted)");
+        return;
+    }
+    if (strcmp(fmt, "[ble] JSON parse failed: %s") == 0) {
+        ESP_LOGE("tuya_sdk", "[ble] JSON parse failed (contents redacted)");
+        return;
+    }
+    if (level == LOG_DEBUG && strncmp(fmt, "[ble] ", 6) == 0) {
+        level = LOG_INFO;
+    }
     char buf[256];
     vsnprintf(buf, sizeof(buf), fmt, args);
     switch (level) {
@@ -43,7 +54,7 @@ static void ble_prov_callback(const tuya_ble_wifi_creds_t *creds)
     s_result.ssid = creds->ssid;
     s_result.password = creds->password;
     s_result.token = creds->token;
-    ESP_LOGI(TAG, "Received credentials: ssid=%s token=%s", creds->ssid, creds->token);
+    ESP_LOGI(TAG, "Received WiFi credentials: ssid=%s (password and token redacted)", creds->ssid);
     xEventGroupSetBits(s_event_group, BLE_PROV_DONE_BIT);
 }
 
@@ -68,8 +79,12 @@ static void ble_full_deinit(void)
 
 bool TuyaBleProvision(int timeout_ms, BleProvResult& result)
 {
+    ESP_LOGI(TAG, "Starting BLE provisioning, timeout_ms=%d (-1 = unlimited)", timeout_ms);
     s_event_group = xEventGroupCreate();
-    if (!s_event_group) return false;
+    if (!s_event_group) {
+        ESP_LOGE(TAG, "Failed to allocate BLE provisioning event group");
+        return false;
+    }
 
     s_result = {};
 
@@ -99,7 +114,7 @@ bool TuyaBleProvision(int timeout_ms, BleProvResult& result)
     }
 
     tuya_ble_prov_cfg_t cfg = {};
-    cfg.device_name = "TUYA";
+    cfg.device_name = "TYBLE";
     cfg.product_key = auth.product_key;
     cfg.uuid = auth.uuid;
     cfg.auth_key = auth.auth_key;
@@ -109,16 +124,19 @@ bool TuyaBleProvision(int timeout_ms, BleProvResult& result)
     if (rc != 0) {
         ESP_LOGE(TAG, "tuya_ble_nimble_start failed: %d", rc);
         vEventGroupDelete(s_event_group);
+        s_event_group = nullptr;
         return false;
     }
 
-    ESP_LOGI(TAG, "BLE advertising started%s", timeout_ms < 0 ? ", waiting for credentials..." : "...");
+    ESP_LOGI(TAG, "BLE host started; waiting for synchronization and WiFi credentials from the Tuya app...");
     EventBits_t bits = xEventGroupWaitBits(
         s_event_group, BLE_PROV_DONE_BIT,
         pdTRUE, pdTRUE,
         timeout_ms < 0 ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms));
 
-    tuya_ble_nimble_stop();
+    ESP_LOGI(TAG, "%s; stopping BLE and releasing BT memory",
+             (bits & BLE_PROV_DONE_BIT) ? "Credentials received" : "Credential wait timed out");
+    ESP_ERROR_CHECK(tuya_ble_nimble_stop());
     ble_full_deinit();
 
     vEventGroupDelete(s_event_group);
@@ -126,7 +144,7 @@ bool TuyaBleProvision(int timeout_ms, BleProvResult& result)
 
     if (bits & BLE_PROV_DONE_BIT) {
         result = s_result;
-        ESP_LOGI(TAG, "BLE provisioning succeeded");
+        ESP_LOGI(TAG, "BLE credential transfer succeeded; handing off to WiFi connection and cloud activation");
         return true;
     }
 

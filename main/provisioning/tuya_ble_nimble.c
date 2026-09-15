@@ -1,5 +1,6 @@
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -7,7 +8,10 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "nimble/nimble_port.h"
-#include "nimble/nimble_port_freertos.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/idf_additions.h"
 #include "host/ble_hs.h"
 #include "host/ble_sm.h"
 #include "host/util/util.h"
@@ -41,7 +45,16 @@ static const ble_uuid128_t s_read_chr_uuid = BLE_UUID128_INIT(
 
 static const ble_uuid16_t s_svc_uuid = BLE_UUID16_INIT(0xFD50);
 
-static tuya_ble_prov_state_t s_prov;
+// Heap-allocated (PSRAM first, internal fallback) instead of static internal
+// DRAM: the prov state alone is ~8.5 KB and the scan buffers ~3.3 KB, and the
+// BLE controller's internal+DMA init allocations fail when these compete for
+// internal RAM before nimble_port_init().
+static tuya_ble_prov_state_t *s_prov;
+// Fewer records than TUYA_BLE_WIFI_LIST_MAX: wifi_ap_record_t needs
+// DMA-capable memory; 8 APs is plenty for the app's picker.
+#define WIFI_SCAN_RECORDS_MAX 8
+static tuya_ble_wifi_ap_t *s_wifi_aps;
+static wifi_ap_record_t *s_wifi_scan_records;
 static bool s_prov_done;
 static uint8_t s_own_addr_type;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -52,10 +65,30 @@ static bool s_wifi_started;
 static esp_netif_t *s_wifi_netif;
 static bool s_wifi_scan_pending;
 static uint32_t s_wifi_scan_token;
-static tuya_ble_wifi_ap_t s_wifi_aps[TUYA_BLE_WIFI_LIST_MAX];
-static wifi_ap_record_t s_wifi_scan_records[TUYA_BLE_WIFI_LIST_MAX];
 static uint16_t s_wifi_ap_count;
 static struct ble_npl_event s_wifi_scan_done;
+static TaskHandle_t s_host_task;
+static StaticSemaphore_t s_host_stopped_storage;
+static SemaphoreHandle_t s_host_stopped;
+
+static void log_internal_heap(const char *stage)
+{
+    const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    ESP_LOGI(TAG, "%s: internal free=%u largest=%u, host stack=%u", stage,
+             (unsigned)heap_caps_get_free_size(caps),
+             (unsigned)heap_caps_get_largest_free_block(caps),
+             (unsigned)CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE);
+}
+
+// Called only by the serialized application start/stop path. On normal stop,
+// join nimble_port_run before deleting the task and destroying its event queue.
+static void host_task_delete(void)
+{
+    if (s_host_task) {
+        vTaskDeleteWithCaps(s_host_task);
+        s_host_task = NULL;
+    }
+}
 
 static int prov_gap_event(struct ble_gap_event *event, void *arg);
 static int prov_gatt_write_access(uint16_t conn_handle, uint16_t attr_handle,
@@ -98,13 +131,60 @@ void tuya_ble_hal_random(uint8_t *buf, size_t len)
     esp_fill_random(buf, len);
 }
 
+static void *psram_calloc(size_t n, size_t size)
+{
+#ifdef CONFIG_SPIRAM
+    void *p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p != NULL) return p;
+#endif
+    return calloc(n, size);
+}
+
+static int prov_buffers_alloc(void)
+{
+    s_prov = psram_calloc(1, sizeof(tuya_ble_prov_state_t));
+    s_wifi_aps = psram_calloc(WIFI_SCAN_RECORDS_MAX, sizeof(tuya_ble_wifi_ap_t));
+    // Scan records must be readable by the WiFi driver: DMA-capable memory.
+    s_wifi_scan_records = heap_caps_calloc(WIFI_SCAN_RECORDS_MAX,
+                                           sizeof(wifi_ap_record_t),
+                                           MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (s_prov == NULL || s_wifi_aps == NULL || s_wifi_scan_records == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate prov buffers");
+        free(s_prov);
+        free(s_wifi_aps);
+        free(s_wifi_scan_records);
+        s_prov = NULL;
+        s_wifi_aps = NULL;
+        s_wifi_scan_records = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static void prov_buffers_free(void)
+{
+    free(s_prov);
+    free(s_wifi_aps);
+    free(s_wifi_scan_records);
+    s_prov = NULL;
+    s_wifi_aps = NULL;
+    s_wifi_scan_records = NULL;
+}
+
 static void wifi_scan_done_on_nimble(struct ble_npl_event *event)
 {
     (void)event;
     if (!s_wifi_scan_pending) return;
     s_wifi_scan_pending = false;
-    (void)tuya_ble_bigdata_wifi_list_complete(&s_prov, s_wifi_scan_token,
-                                              s_wifi_aps, s_wifi_ap_count);
+    int rc = tuya_ble_bigdata_wifi_list_complete(s_prov, s_wifi_scan_token,
+                                                s_wifi_aps, s_wifi_ap_count);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "WiFi list response rejected: scan_id=%lu APs=%u rc=%d",
+                 (unsigned long)s_wifi_scan_token, s_wifi_ap_count, rc);
+    } else {
+        ESP_LOGI(TAG, "WiFi list response queued: scan_id=%lu available_APs=%u",
+                 (unsigned long)s_wifi_scan_token, s_wifi_ap_count);
+    }
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
@@ -115,7 +195,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     if (event_base != WIFI_EVENT || event_id != WIFI_EVENT_SCAN_DONE ||
         !s_wifi_scan_pending) return;
 
-    uint16_t count = TUYA_BLE_WIFI_LIST_MAX;
+    uint16_t count = WIFI_SCAN_RECORDS_MAX;
     s_wifi_ap_count = 0;
     esp_err_t err = esp_wifi_scan_get_ap_records(&count, s_wifi_scan_records);
     if (err == ESP_OK) {
@@ -136,7 +216,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
 static void wifi_scan_cancel(void)
 {
-    if (s_wifi_scan_pending) (void)esp_wifi_scan_stop();
+    if (s_wifi_scan_pending) {
+        ESP_LOGI(TAG, "Cancelling WiFi scan: scan_id=%lu", (unsigned long)s_wifi_scan_token);
+        (void)esp_wifi_scan_stop();
+    }
     s_wifi_scan_pending = false;
     s_wifi_ap_count = 0;
 }
@@ -144,19 +227,27 @@ static void wifi_scan_cancel(void)
 static int wifi_scan_request(uint16_t count, const char *ccode,
                              uint32_t token, void *ctx)
 {
-    (void)count;
     (void)ctx;
-    if (s_wifi_scan_pending) return -1;
+    ESP_LOGI(TAG, "WiFi scan requested: scan_id=%lu count=%u country=%.2s",
+             (unsigned long)token, count, ccode[0] ? ccode : "--");
+    if (s_wifi_scan_pending) {
+        ESP_LOGW(TAG, "WiFi scan rejected: scan_id=%lu still pending",
+                 (unsigned long)s_wifi_scan_token);
+        return -1;
+    }
 
     // WifiManager initializes the driver, but starts STA only after provisioning.
     if (!s_wifi_started) {
         esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
-        if (err != ESP_OK) {
+        if (err != ESP_OK && err != ESP_ERR_WIFI_STATE) {
             ESP_LOGE(TAG, "esp_wifi_set_mode failed: %s", esp_err_to_name(err));
             return -1;
         }
         err = esp_wifi_start();
-        if (err != ESP_OK) {
+        // WifiManager may already have started the driver while entering
+        // config mode.  Reusing that instance is equivalent to the demo's
+        // first start and avoids rejecting the BLE scan request.
+        if (err != ESP_OK && err != ESP_ERR_WIFI_STATE) {
             ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
             return -1;
         }
@@ -218,7 +309,7 @@ static int prov_gatt_write_access(uint16_t conn_handle, uint16_t attr_handle,
 
     uint8_t raw[TUYA_BLE_RX_BUF_SIZE];
     os_mbuf_copydata(ctxt->om, 0, len, raw);
-    if (tuya_ble_prov_on_data(&s_prov, raw, len) != 0) {
+    if (tuya_ble_prov_on_data(s_prov, raw, len) != 0) {
         ESP_LOGW(TAG, "[GATT] on_data rejected %d bytes", len);
     }
     return 0;
@@ -245,7 +336,7 @@ static int prov_gatt_read_access(uint16_t conn_handle, uint16_t attr_handle,
     const uint8_t *rsp_data;
     uint8_t adv_len;
     uint8_t rsp_len;
-    tuya_ble_prov_get_read_payload(&s_prov, &adv_data, &adv_len, &rsp_data, &rsp_len);
+    tuya_ble_prov_get_read_payload(s_prov, &adv_data, &adv_len, &rsp_data, &rsp_len);
 
     ESP_LOGI(TAG, "[GATT] Read characteristic, returning adv+rsp (%d+%d bytes)", adv_len, rsp_len);
 
@@ -262,10 +353,21 @@ static void prov_start_advertise(void)
     const uint8_t *rsp_data;
     uint8_t adv_len;
     uint8_t rsp_len;
-    tuya_ble_prov_get_adv_data(&s_prov, &adv_data, &adv_len, &rsp_data, &rsp_len);
+    tuya_ble_prov_get_adv_data(s_prov, &adv_data, &adv_len, &rsp_data, &rsp_len);
+    ESP_LOGI(TAG, "Advertising payloads: adv_len=%u rsp_len=%u", adv_len, rsp_len);
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, adv_data, adv_len, ESP_LOG_INFO);
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, rsp_data, rsp_len, ESP_LOG_INFO);
 
-    ble_gap_adv_set_data(adv_data, adv_len);
-    ble_gap_adv_rsp_set_data(rsp_data, rsp_len);
+    int rc = ble_gap_adv_set_data(adv_data, adv_len);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_adv_set_data failed, rc=%d", rc);
+        return;
+    }
+    rc = ble_gap_adv_rsp_set_data(rsp_data, rsp_len);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_adv_rsp_set_data failed, rc=%d", rc);
+        return;
+    }
 
     struct ble_gap_adv_params adv_params = {0};
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
@@ -273,12 +375,15 @@ static void prov_start_advertise(void)
     adv_params.itvl_min = ADV_INTERVAL_MIN;
     adv_params.itvl_max = ADV_INTERVAL_MAX;
 
-    int rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
+    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
                                &adv_params, prov_gap_event, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to start advertising, rc=%d", rc);
+        ESP_LOGE(TAG, "Advertising active=%d", ble_gap_adv_active());
+        return;
     }
-    ESP_LOGI(TAG, "Advertising started");
+    ESP_LOGI(TAG, "Advertising started, active=%d, interval=%u..%u (0.625ms units)",
+             ble_gap_adv_active(), adv_params.itvl_min, adv_params.itvl_max);
 }
 
 static int prov_gap_event(struct ble_gap_event *event, void *arg)
@@ -291,9 +396,9 @@ static int prov_gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             wifi_scan_cancel();
-            tuya_ble_prov_close(&s_prov);
+            tuya_ble_prov_close(s_prov);
             s_notify_enabled = false;
-            tuya_ble_prov_tick(&s_prov, (uint64_t)esp_timer_get_time() / 1000);
+            tuya_ble_prov_tick(s_prov, (uint64_t)esp_timer_get_time() / 1000);
             ble_gap_conn_find(s_conn_handle, &desc);
             ESP_LOGI(TAG, "[GAP] CONNECT, handle=%d, peer=%02x:%02x:%02x:%02x:%02x:%02x",
                      s_conn_handle,
@@ -313,7 +418,7 @@ static int prov_gap_event(struct ble_gap_event *event, void *arg)
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_notify_enabled = false;
         wifi_scan_cancel();
-        tuya_ble_prov_close(&s_prov);
+        tuya_ble_prov_close(s_prov);
         if (!s_prov_done) {
             prov_start_advertise();
         }
@@ -321,7 +426,7 @@ static int prov_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "[GAP] MTU=%d", event->mtu.value);
-        tuya_ble_prov_set_gatt_payload(&s_prov, event->mtu.value - 3);
+        tuya_ble_prov_set_gatt_payload(s_prov, event->mtu.value - 3);
         break;
 
     case BLE_GAP_EVENT_ENC_CHANGE:
@@ -334,7 +439,7 @@ static int prov_gap_event(struct ble_gap_event *event, void *arg)
                  event->subscribe.cur_notify, event->subscribe.cur_indicate);
         if (event->subscribe.attr_handle == s_notify_attr_handle) {
             s_notify_enabled = event->subscribe.cur_notify;
-            if (s_notify_enabled) tuya_ble_prov_tx_ready(&s_prov);
+            if (s_notify_enabled) tuya_ble_prov_tx_ready(s_prov);
             ESP_LOGI(TAG, "[GAP] Tuya notify %s", s_notify_enabled ? "ENABLED" : "DISABLED");
         }
         break;
@@ -386,7 +491,7 @@ static void ble_on_reset(int reason)
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     s_notify_enabled = false;
     wifi_scan_cancel();
-    tuya_ble_prov_close(&s_prov);
+    tuya_ble_prov_close(s_prov);
 }
 
 /* Runs on the NimBLE event queue, never the application/IoT task. */
@@ -394,7 +499,8 @@ static void transport_tick(struct ble_npl_event *event)
 {
     (void)event;
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE &&
-        tuya_ble_prov_tick(&s_prov, (uint64_t)esp_timer_get_time() / 1000) < 0) {
+        tuya_ble_prov_tick(s_prov, (uint64_t)esp_timer_get_time() / 1000) < 0) {
+        ESP_LOGW(TAG, "BLE transport failed or timed out; terminating handle=%u", s_conn_handle);
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
     if (!s_prov_done) ble_npl_callout_reset(&s_transport_timer, ble_npl_time_ms_to_ticks32(100));
@@ -403,13 +509,20 @@ static void transport_tick(struct ble_npl_event *event)
 static void nimble_host_task(void *param)
 {
     (void)param;
+    // Wait until controller and callbacks are ready before entering NimBLE.
+    // No NimBLE API may be used until application initialization is complete.
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    ESP_LOGI(TAG, "NimBLE host task running");
+    ble_npl_callout_reset(&s_transport_timer, ble_npl_time_ms_to_ticks32(100));
     nimble_port_run();
-    nimble_port_freertos_deinit();
+    ESP_LOGI(TAG, "NimBLE host task stopped");
+    xSemaphoreGive(s_host_stopped);
+    vTaskSuspend(NULL);
 }
 
 int tuya_ble_nimble_start(const tuya_ble_prov_cfg_t *cfg)
 {
-    if (cfg == NULL || cfg->device_name == NULL || cfg->product_key == NULL ||
+    if (s_host_task != NULL || cfg == NULL || cfg->device_name == NULL || cfg->product_key == NULL ||
         cfg->uuid == NULL || cfg->auth_key == NULL || cfg->cb == NULL) {
         return -1;
     }
@@ -436,13 +549,38 @@ int tuya_ble_nimble_start(const tuya_ble_prov_cfg_t *cfg)
         .wifi_scan_ctx = NULL,
     };
 
-    if (tuya_ble_prov_init(&s_prov, &prov_cfg) != 0) {
+    if (prov_buffers_alloc() != 0) {
         return -1;
     }
 
+    if (tuya_ble_prov_init(s_prov, &prov_cfg) != 0) {
+        prov_buffers_free();
+        return -1;
+    }
+
+    log_internal_heap("Before host task reservation");
+    s_host_stopped = xSemaphoreCreateBinaryStatic(&s_host_stopped_storage);
+#if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+    const uint32_t stack_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+#else
+    const uint32_t stack_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+#endif
+    BaseType_t task_rc = xTaskCreatePinnedToCoreWithCaps(nimble_host_task, "nimble_host",
+        CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE, NULL, configMAX_PRIORITIES - 4,
+        &s_host_task, CONFIG_BT_NIMBLE_PINNED_TO_CORE, stack_caps);
+    if (task_rc != pdPASS) {
+        ESP_LOGE(TAG, "Host task allocation failed: rc=%d", (int)task_rc);
+        log_internal_heap("Host allocation failure");
+        prov_buffers_free();
+        return -1;
+    }
+    log_internal_heap("Before controller initialization");
     int rc = nimble_port_init();
     if (rc != 0) {
         ESP_LOGE(TAG, "nimble_port_init failed, rc=%d", rc);
+        log_internal_heap("Controller initialization failure");
+        host_task_delete();
+        prov_buffers_free();
         return -1;
     }
 
@@ -459,15 +597,20 @@ int tuya_ble_nimble_start(const tuya_ble_prov_cfg_t *cfg)
     rc = ble_gatts_count_cfg(s_gatt_svcs);
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_gatts_count_cfg failed, rc=%d", rc);
+        host_task_delete();
+        nimble_port_deinit();
+        prov_buffers_free();
         return -1;
     }
 
     rc = ble_gatts_add_svcs(s_gatt_svcs);
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_gatts_add_svcs failed, rc=%d", rc);
+        host_task_delete();
+        nimble_port_deinit();
+        prov_buffers_free();
         return -1;
     }
-
     // Release our temporary netif before WifiStation creates its own on handoff.
     if (esp_netif_get_handle_from_ifkey("WIFI_STA_DEF") == NULL) {
         s_wifi_netif = esp_netif_create_default_wifi_sta();
@@ -477,9 +620,9 @@ int tuya_ble_nimble_start(const tuya_ble_prov_cfg_t *cfg)
     ble_npl_event_init(&s_wifi_scan_done, wifi_scan_done_on_nimble, NULL);
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,
                                                 wifi_event_handler, NULL));
-    ble_npl_callout_reset(&s_transport_timer, ble_npl_time_ms_to_ticks32(100));
     ble_store_clear();
-    nimble_port_freertos_init(nimble_host_task);
+    log_internal_heap("Controller ready, resuming host");
+    xTaskNotifyGive(s_host_task);
 
     ESP_LOGI(TAG, "BLE provisioning started, device=%s, notify_handle=%d",
              cfg->device_name, s_notify_attr_handle);
@@ -488,9 +631,12 @@ int tuya_ble_nimble_start(const tuya_ble_prov_cfg_t *cfg)
 
 int tuya_ble_nimble_stop(void)
 {
+    if (!s_host_task) return 0;
     s_prov_done = true;
     int rc = nimble_port_stop();
     if (rc == 0) {
+        xSemaphoreTake(s_host_stopped, portMAX_DELAY);
+        host_task_delete();
         ble_npl_callout_stop(&s_transport_timer);
         ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,
                                                      wifi_event_handler));
@@ -503,8 +649,10 @@ int tuya_ble_nimble_stop(void)
             esp_netif_destroy_default_wifi(s_wifi_netif);
             s_wifi_netif = NULL;
         }
+        ble_npl_callout_deinit(&s_transport_timer);
         nimble_port_deinit();
+        prov_buffers_free();
     }
-    ESP_LOGI(TAG, "BLE provisioning stopped");
-    return 0;
+    ESP_LOGI(TAG, "BLE provisioning stop result=%d", rc);
+    return rc;
 }
