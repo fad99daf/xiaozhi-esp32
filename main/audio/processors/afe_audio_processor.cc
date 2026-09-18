@@ -49,11 +49,21 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
         afe_config->ns_init = true;
         afe_config->ns_model_name = ns_model_name;
         afe_config->afe_ns_mode = AFE_NS_MODE_NET;
+#if CONFIG_SR_NSN_WEBRTC
+    } else {
+        // WebRTC NS is built into ESP-SR and is selected by this special model name.
+        static char kWebRtcNsModelName[] = "WEBRTC";
+        afe_config->ns_init = true;
+        afe_config->ns_model_name = kWebRtcNsModelName;
+        afe_config->afe_ns_mode = AFE_NS_MODE_WEBRTC;
+    }
+#else
     } else {
         afe_config->ns_init = false;
     }
+#endif
 
-    afe_config->agc_init = false;
+    afe_config->agc_init = true;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
 #ifdef CONFIG_USE_DEVICE_AEC

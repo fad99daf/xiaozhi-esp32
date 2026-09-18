@@ -270,7 +270,7 @@ void AudioService::AudioInputTask() {
         }
         if (audio_input_need_warmup_) {
             audio_input_need_warmup_ = false;
-            vTaskDelay(pdMS_TO_TICKS(120));
+            vTaskDelay(pdMS_TO_TICKS(80));
             continue;
         }
 
