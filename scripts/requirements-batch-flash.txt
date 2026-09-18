@@ -1,0 +1,12 @@
+# Batch firmware + Tuya credential flashing backend dependencies.
+#
+# Install once per ESP-IDF Python environment:
+#   idf tuya-batch-setup
+# or directly:
+#   python -m pip install -r scripts/requirements-batch-flash.txt
+#
+# Ranges are bounded to stay compatible with ESP-IDF 5.5.x host environments
+# and to avoid unrelated major upgrades. pyserial is used directly for USB
+# candidate discovery; openpyxl reads/writes the credential workbook.
+openpyxl>=3.0,<4
+pyserial>=3.4,<4

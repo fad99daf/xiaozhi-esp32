@@ -16,9 +16,12 @@ import argparse
 import csv
 import io
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 NAMESPACE = "tuya_auth"
 KEYS = ("uuid", "auth_key", "product_key")
@@ -37,6 +40,117 @@ LENGTH_LIMITS = {
     "auth_key": (32, 63),
     "product_key": (16, 31),
 }
+
+
+class AuthToolError(RuntimeError):
+    """Secret-free error raised by reusable auth operations."""
+
+    def __init__(self, stage, message, detail=None):
+        super().__init__(message)
+        self.stage = stage
+        self.message = message
+        self.detail = detail
+
+    def __str__(self):
+        if self.detail:
+            return "%s: %s" % (self.message, self.detail)
+        return self.message
+
+
+class CommandCancelled(AuthToolError):
+    def __init__(self, stage="cancelled"):
+        super().__init__(stage, "operation cancelled")
+
+
+def check_cancelled(cancel_event, stage):
+    """Raise CommandCancelled if the shared cancellation event is set."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise CommandCancelled(stage)
+
+
+def _terminate_process(process):
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=2)
+        if os.name != "posix":
+            return
+    except subprocess.TimeoutExpired:
+        pass
+    # A reaped leader does not imply its esptool descendants have exited.
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def run_command(command, stage, timeout=None, cancel_event=None, env=None):
+    """Run a command with captured output and process-group cancellation."""
+    kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "env": env,
+    }
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+    check_cancelled(cancel_event, stage)
+    try:
+        process = subprocess.Popen(command, **kwargs)
+    except OSError as exc:
+        raise AuthToolError(stage, "could not start command", str(exc)) from exc
+
+    try:
+        started = time.monotonic()
+        while True:
+            check_cancelled(cancel_event, stage)
+            remaining = None
+            if timeout is not None:
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise AuthToolError(stage, "command timed out after %.1fs" % timeout)
+            try:
+                stdout, stderr = process.communicate(
+                    timeout=min(0.2, remaining) if remaining is not None else 0.2)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException:
+        _terminate_process(process)
+        raise
+    finally:
+        process.stdout.close()
+        process.stderr.close()
+
+    result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    if result.returncode != 0:
+        lines = [line.strip() for line in (stdout or "").splitlines()
+                 if "fatal error" in line.lower()]
+        fallback = (stderr or stdout or "").strip().splitlines()[-5:]
+        detail = " | ".join(lines or fallback) or "command failed"
+        raise AuthToolError(stage, "command failed", detail)
+    return result
+
+
+def find_idf_tools_structured():
+    idf_path = os.environ.get("IDF_PATH")
+    if not idf_path:
+        raise AuthToolError(
+            "preflight", "IDF_PATH is not set",
+            "run from an ESP-IDF environment (or via idf.py)")
+    parttool = os.path.join(idf_path, "components", "partition_table", "parttool.py")
+    if not os.path.isfile(parttool):
+        raise AuthToolError("preflight", "parttool.py not found", parttool)
+    return parttool
 
 
 def find_idf_tools():
@@ -114,31 +228,53 @@ def _fail_parttool(action, detail_lines):
              "monitor and check -p/--port." % (action, "\n  ".join(lines)))
 
 
-def run_parttool(parttool, port, baud, extra, capture=True):
-    """Run parttool.py, always capturing output.
-
-    Capture is unconditional because parttool's --quiet cannot suppress
-    errors raised before its own try/except (e.g. partition-table read
-    failures in ParttoolTarget.__init__), which otherwise leak tracebacks.
-    Success output is echoed afterwards so progress stays visible.
-    """
-    cmd = [sys.executable, parttool, "--port", port, "--quiet"]
+def run_parttool_operation(parttool, port, baud, extra, stage,
+                           timeout=None, cancel_event=None, *, before=None, after=None,
+                           partition_table_offset=None):
+    cmd = [sys.executable, parttool]
+    reset_args = ["%s=%s" % (name, value) for name, value in
+                  (("before", before), ("after", after)) if value is not None]
+    if reset_args:
+        cmd += ["--esptool-args"] + reset_args
+    # --port terminates parttool's greedy --esptool-args list before the action.
+    cmd += ["--port", port, "--quiet"]
     if baud:
         cmd += ["--baud", str(baud)]
+    if partition_table_offset is not None:
+        cmd += ["--partition-table-offset", hex(partition_table_offset)]
     cmd += extra
+    return run_command(cmd, stage, timeout=timeout, cancel_event=cancel_event)
+
+
+def run_parttool(parttool, port, baud, extra, capture=True):
+    """Run parttool.py while preserving the original CLI error contract."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                check=True)
-    except subprocess.CalledProcessError as exc:
-        # esptool's friendly diagnostics go to parttool's stdout; the
-        # stderr traceback tail is only a fallback.
-        out_lines = [l for l in (exc.stdout or "").splitlines()
-                     if "fatal error" in l.lower()]
-        detail = out_lines or (exc.stderr or "").strip().splitlines()[-5:]
-        _fail_parttool(extra[0], detail)
+        result = run_parttool_operation(
+            parttool, port, baud, extra, "parttool_%s" % extra[0])
+    except AuthToolError as exc:
+        _fail_parttool(extra[0], [exc.detail or exc.message])
     if not capture and result.stdout:
         print(result.stdout, end="")
     return result
+
+
+def get_partition_size_operation(parttool, port, baud, timeout=None,
+                                 cancel_event=None, *, before=None, after=None,
+                                 partition_table_offset=None):
+    res = run_parttool_operation(
+        parttool, port, baud,
+        ["get_partition_info", "--partition-name", "nvs", "--info", "size"],
+        "auth_write", timeout, cancel_event, before=before, after=after,
+        partition_table_offset=partition_table_offset)
+    lines = res.stdout.strip().splitlines()
+    size_text = lines[-1].strip() if lines else ""
+    try:
+        size = int(size_text, 0)
+    except ValueError as exc:
+        raise AuthToolError("auth_write", "could not parse nvs partition size") from exc
+    if size <= 0:
+        raise AuthToolError("auth_write", "invalid nvs partition size")
+    return size
 
 
 def get_partition_size(parttool, port, baud):
@@ -152,7 +288,7 @@ def get_partition_size(parttool, port, baud):
         sys.exit("error: could not parse nvs partition size from: %r" % size)
 
 
-def parse_nvs_dump(image_path):
+def parse_nvs_dump(image_path, strict=False):
     """Parse an NVS partition image, return {namespace: {key: value}} for strings."""
     idf_path = os.environ["IDF_PATH"]
     tool_dir = os.path.join(idf_path, "components", "nvs_flash", "nvs_partition_tool")
@@ -174,13 +310,98 @@ def parse_nvs_dump(image_path):
             if meta["type"] != "string":
                 continue
             raw = b"".join(bytes(child.raw) for child in entry.children)
-            # Trailing NULs are cell padding, not part of the stored value.
-            value = raw[: entry.data["size"]].rstrip(b"\x00").decode(
-                "utf-8", errors="replace")
+            size = entry.data["size"]
+            if strict:
+                if size < 1 or size > len(raw) or raw[size - 1] != 0:
+                    raise ValueError("malformed NVS string payload")
+                value = raw[:size - 1].decode("utf-8")
+            else:
+                value = raw[:size].rstrip(b"\x00").decode("utf-8", errors="replace")
             ns_name = namespaces.get(meta["namespace"], "?")
             namespaces.setdefault(ns_name, {})[entry.key] = value
     return {name: data for name, data in namespaces.items()
             if name != "?" or isinstance(data, dict) and data}
+
+
+def validate_values_structured(values):
+    for key in KEYS:
+        value = values.get(key)
+        if not isinstance(value, str) or not value:
+            raise AuthToolError("auth_write", "missing credential field %s" % key)
+        if "\x00" in value:
+            raise AuthToolError("auth_write", "credential field %s contains NUL" % key)
+        lo, hi = LENGTH_LIMITS[key]
+        byte_length = len(value.encode("utf-8"))
+        if not lo <= byte_length <= hi:
+            raise AuthToolError(
+                "auth_write", "%s UTF-8 length %d out of range %d..%d"
+                % (key, byte_length, lo, hi))
+
+
+def write_verify_identity(port, baud, values, timeout=None, cancel_event=None,
+                          stage_callback=None, temp_parent=None, *,
+                          before=None, after=None, partition_table_offset=None):
+    """Write/verify silently; optional resets apply to EVERY nested esptool call.
+
+    Batch callers should use after='no_reset' and apply the manifest's final
+    reset separately after verification. partition_table_offset is an integer
+    byte offset used for every parttool call. None preserves parttool defaults.
+    """
+    validate_values_structured(values)
+    parttool = find_idf_tools_structured()
+    check_cancelled(cancel_event, "auth_write")
+    if stage_callback:
+        stage_callback("auth_write")
+    size = get_partition_size_operation(
+        parttool, port, baud, timeout=timeout, cancel_event=cancel_event,
+        before=before, after=after, partition_table_offset=partition_table_offset)
+    check_cancelled(cancel_event, "auth_write")
+
+    with tempfile.TemporaryDirectory(prefix="tuya_auth_", dir=temp_parent) as tmp:
+        os.chmod(tmp, 0o700)
+        csv_path = os.path.join(tmp, "tuya_auth.csv")
+        image_path = os.path.join(tmp, "tuya_auth.bin")
+        dump_path = os.path.join(tmp, "nvs_dump.bin")
+        fd = os.open(csv_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as csv_file:
+            csv_file.write(values_to_nvs_csv(values))
+
+        run_command(
+            [sys.executable, "-m", "esp_idf_nvs_partition_gen", "generate",
+             csv_path, image_path, hex(size)],
+            "auth_write", timeout=timeout, cancel_event=cancel_event)
+        check_cancelled(cancel_event, "auth_write")
+        os.chmod(image_path, 0o600)
+        run_parttool_operation(
+            parttool, port, baud,
+            ["write_partition", "--partition-name", "nvs", "--input", image_path],
+            "auth_write", timeout, cancel_event, before=before, after=after,
+            partition_table_offset=partition_table_offset)
+
+        if stage_callback:
+            stage_callback("auth_read")
+        check_cancelled(cancel_event, "auth_read")
+        run_parttool_operation(
+            parttool, port, baud,
+            ["read_partition", "--partition-name", "nvs", "--output", dump_path],
+            "auth_read", timeout, cancel_event, before=before, after=after,
+            partition_table_offset=partition_table_offset)
+        if stage_callback:
+            stage_callback("auth_verify")
+        check_cancelled(cancel_event, "auth_verify")
+        try:
+            with open(image_path, "rb") as image, open(dump_path, "rb") as dump:
+                if dump.read() != image.read():
+                    raise ValueError("nvs read-back differs from generated image")
+            stored = parse_nvs_dump(dump_path, strict=True).get(NAMESPACE, {})
+        except Exception as exc:
+            raise AuthToolError("auth_verify", "malformed nvs read-back") from exc
+        mismatch = [key for key in KEYS if stored.get(key) != values[key]]
+        if mismatch:
+            raise AuthToolError(
+                "auth_verify", "verification failed for fields: %s"
+                % ", ".join(mismatch))
+    return True
 
 
 def cmd_write(args):

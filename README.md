@@ -77,6 +77,18 @@ idf.py -p PORT tuya-auth-read           # 查看设备上已存储的授权码
 
 > ⚠️ 此文件包含设备凭据, 请勿提交到公开仓库。建议将其加入 `.gitignore`。
 
+### 批量烧录固件和授权码
+
+批量生产时先在当前 ESP-IDF Python 环境安装依赖并编译目标板固件，然后用 PID 自动发现、确认、探测和并行烧录 USB 设备：
+
+```sh
+idf tuya-batch-setup                 # 每个 IDF Python 环境只需一次
+idf build                            # 只编译一次目标板配置
+idf tuya-batch-flash --pid YOUR_PRODUCT_PID
+```
+
+命令会完整烧录 `build/flasher_args.json` 中列出的固件/资源镜像，为每台设备分配 `auth-info.xlsx` 中唯一的 `uuid`/`key`，写入并回读校验 NVS，然后安全记录 `used` 或 `fail`。运行前请关闭表格和串口监视器，并拔掉无关串口设备及已经烧录过的设备。`tuya-auth-flash` 单设备命令保持可用。自动发现、`--device` 筛选、试运行、重试、表格恢复和安全限制请见 [批量烧录指南](docs/batch-flash.md)。
+
 
 ### 2. menuconfig 配置
 

@@ -24,3 +24,9 @@ mmap_generate_*.h
 .vim
 .vimspector.json
 tuya_authkey.txt
+
+# Local batch-flash credentials and state
+auth-info.xlsx
+auth-info.xlsx.lock
+auth-info.xlsx.batch-backup.xlsx
+auth-info.xlsx.batch-journal.jsonl

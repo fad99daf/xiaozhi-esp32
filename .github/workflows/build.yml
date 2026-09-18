@@ -102,16 +102,27 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Run host test suite
+      - name: Install batch flash host dependencies through IDF setup
         shell: bash
         run: |
           source $IDF_PATH/export.sh
-          python -m unittest discover -s tests -p 'test_tuya_auth*.py' -v
+          idf.py tuya-batch-setup
 
-      - name: Check idf.py tuya-auth actions register
+      - name: Run synthetic host test suites
         shell: bash
         run: |
           source $IDF_PATH/export.sh
+          python3 -m unittest discover -s tests -p 'test_batch_flash*.py' -v
+          python3 -m unittest discover -s tests -p 'test_tuya_auth*.py' -v
+          python3 -m unittest discover -s tests -p 'test_idf_ext.py' -v
+          python3 -m unittest discover -s tests -p 'test_idf_batch_parser.py' -v
+
+      - name: Check idf.py Tuya actions register
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          idf.py tuya-batch-setup --help
+          idf.py tuya-batch-flash --help
           idf.py tuya-auth-flash --help
           idf.py tuya-auth-read --help
 
