@@ -1,6 +1,7 @@
 #include "ota.h"
 #include "system_info.h"
 #include "settings.h"
+#include "tuya_version_report_state.h"
 #include "assets/lang_config.h"
 
 #include <freertos/FreeRTOS.h>
@@ -306,6 +307,7 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
     ESP_LOGI(TAG, "Writing to partition %s at offset 0x%lx", update_partition->label, update_partition->address);
     bool image_header_checked = false;
     std::string image_header;
+    std::string target_version;
 
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(0);
@@ -362,6 +364,7 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
             if (image_header.size() >= sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t)) {
                 esp_app_desc_t new_app_info;
                 memcpy(&new_app_info, image_header.data() + sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t), sizeof(esp_app_desc_t));
+                target_version = new_app_info.version;
 
                 if (esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle)) {
                     esp_ota_abort(update_handle);
@@ -412,6 +415,11 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
         return false;
     }
 
+#if CONFIG_PROTOCOL_TUYA
+    if (!TuyaVersionReportState::MarkPending(target_version.c_str())) {
+        ESP_LOGW(TAG, "Could not persist pending version report; next boot will report by default");
+    }
+#endif
     ESP_LOGI(TAG, "Firmware upgrade successful");
     return true;
 }
@@ -558,6 +566,8 @@ bool Ota::CheckTuyaVersion(std::function<void(int progress, size_t speed)> callb
     cfg.mqtt_disable_tls = false;
     cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
     cfg.sw_ver = current_version_.c_str();
+    cfg.skip_version_report = true;
+    ESP_LOGI(TAG, "Skipping version/metadata for temporary OTA-check client");
 
     iot_client_t* client = iot_client_init(&cfg);
     if (!client) {
