@@ -11,9 +11,11 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include "tuya_version_report_state.h"
 
 #include <cstring>
 #include <esp_log.h>
+#include <esp_app_desc.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
 #include <arpa/inet.h>
@@ -333,11 +335,29 @@ void Application::ActivationTask() {
     // Check for new assets version
     CheckAssetsVersion();
 
+    bool protocol_initialized = false;
+#if CONFIG_PROTOCOL_TUYA
+    Settings tuya_settings("tuya", false);
+    if (!tuya_settings.GetString("devid").empty() &&
+        TuyaVersionReportState::ShouldReport(esp_app_get_description()->version)) {
+        protocol_initialized = InitializeProtocol();
+        if (!protocol_initialized) {
+#if CONFIG_TUYA_BLE_PROVISIONING
+            ESP_LOGW(TAG, "Tuya activation is required; entering BLE provisioning");
+            if (auto* wifi_board = dynamic_cast<WifiBoard*>(&Board::GetInstance())) {
+                wifi_board->EnterWifiConfigMode();
+            }
+#endif
+            return;
+        }
+    }
+#endif
+
     // Check for new firmware version
     CheckNewVersion();
 
     // Initialize the protocol
-    if (!InitializeProtocol()) {
+    if (!protocol_initialized && !InitializeProtocol()) {
 #if CONFIG_TUYA_BLE_PROVISIONING
         ESP_LOGW(TAG, "Tuya activation is required; entering BLE provisioning");
         if (auto* wifi_board = dynamic_cast<WifiBoard*>(&Board::GetInstance())) {
@@ -346,6 +366,8 @@ void Application::ActivationTask() {
 #endif
         return;
     }
+
+    ota_->MarkCurrentVersionValid();
 
     // Signal completion to main loop
     xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
@@ -411,8 +433,6 @@ void Application::CheckAssetsVersion() {
 
 void Application::CheckNewVersion() {
 #if CONFIG_PROTOCOL_TUYA
-    ota_->MarkCurrentVersionValid();
-
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
     display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
