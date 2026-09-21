@@ -34,7 +34,6 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
         models = models_list;
     }
 
-    char* ns_model_name = esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL);
     char* vad_model_name = esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL);
     
     afe_config_t* afe_config = afe_config_init(input_format.c_str(), NULL, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
@@ -45,23 +44,9 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
         afe_config->vad_model_name = vad_model_name;
     }
 
-    if (ns_model_name != nullptr) {
-        afe_config->ns_init = true;
-        afe_config->ns_model_name = ns_model_name;
-        afe_config->afe_ns_mode = AFE_NS_MODE_NET;
-#if CONFIG_SR_NSN_WEBRTC
-    } else {
-        // WebRTC NS is built into ESP-SR and is selected by this special model name.
-        static char kWebRtcNsModelName[] = "WEBRTC";
-        afe_config->ns_init = true;
-        afe_config->ns_model_name = kWebRtcNsModelName;
-        afe_config->afe_ns_mode = AFE_NS_MODE_WEBRTC;
-    }
-#else
-    } else {
-        afe_config->ns_init = false;
-    }
-#endif
+    // ESP-SR in this AEC profile crashes while creating the device-side NS path.
+    // Keep cloud NS enabled and leave AEC/AGC active on the device.
+    afe_config->ns_init = false;
 
     afe_config->agc_init = true;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
