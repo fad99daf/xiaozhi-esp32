@@ -114,6 +114,11 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+
+    // Release the active Tuya App binding before Wi-Fi re-provisioning.
+    // Returns false without changing local credentials if cloud confirmation
+    // cannot be obtained.
+    bool UnbindTuyaForWifiReprovisioning();
     
     /**
      * Reset protocol resources (thread-safe)

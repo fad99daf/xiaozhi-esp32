@@ -9,7 +9,9 @@
 class WifiBoard : public Board {
 protected:
     esp_timer_handle_t connect_timer_ = nullptr;
+    esp_timer_handle_t reprovision_timeout_timer_ = nullptr;
     bool in_config_mode_ = false;
+    bool reprovisioning_ = false;
     NetworkEventCallback network_event_callback_ = nullptr;
 
     virtual std::string GetBoardJson() override;
@@ -36,6 +38,16 @@ protected:
      */
     static void OnWifiConnectTimeout(void* arg);
 
+    /**
+     * Recover from a Tuya unbind call that did not return.
+     */
+    static void OnTuyaReprovisionTimeout(void* arg);
+
+    /**
+     * Clear local Tuya and Wi-Fi state, then restart into BLE provisioning.
+     */
+    void ForceLocalTuyaReprovisioning(const char* notification);
+
 public:
     WifiBoard();
     virtual ~WifiBoard();
@@ -59,6 +71,11 @@ public:
      * Enter WiFi configuration mode (thread-safe, can be called from any task)
      */
     void EnterWifiConfigMode();
+
+    /**
+     * Continue a user-initiated reprovisioning request after a recovery reboot.
+     */
+    bool ResumePendingTuyaReprovisioning();
     
     /**
      * Check if in WiFi config mode

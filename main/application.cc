@@ -320,6 +320,13 @@ void Application::HandleActivationDoneEvent() {
     auto& board = Board::GetInstance();
     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
 
+#if CONFIG_TUYA_BLE_PROVISIONING
+    if (auto* wifi_board = dynamic_cast<WifiBoard*>(&board);
+        wifi_board && wifi_board->ResumePendingTuyaReprovisioning()) {
+        return;
+    }
+#endif
+
     Schedule([this]() {
         // Play the success sound to indicate the device is ready
         audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
@@ -1207,6 +1214,14 @@ void Application::PlaySound(const std::string_view& sound) {
     audio_service_.PlaySound(sound);
 }
 
+bool Application::UnbindTuyaForWifiReprovisioning() {
+    if (!protocol_) {
+        ESP_LOGE(TAG, "Cannot unbind Tuya device: protocol is not initialized");
+        return false;
+    }
+    return protocol_->UnbindForWifiReprovisioning();
+}
+
 void Application::ResetProtocol() {
     Schedule([this]() {
         // Close audio channel if opened
@@ -1217,4 +1232,3 @@ void Application::ResetProtocol() {
         protocol_.reset();
     });
 }
-

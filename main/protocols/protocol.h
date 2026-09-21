@@ -74,6 +74,11 @@ public:
     virtual void SendAbortSpeaking(AbortReason reason);
     virtual void SendMcpMessage(const std::string& message);
 
+    // Release the current cloud binding before local Wi-Fi credentials are
+    // discarded for re-provisioning. Protocols without a cloud binding return
+    // false so callers keep local state intact.
+    virtual bool UnbindForWifiReprovisioning() { return false; }
+
 protected:
     std::function<void(const cJSON* root)> on_incoming_json_;
     std::function<void(std::unique_ptr<AudioStreamPacket> packet)> on_incoming_audio_;
@@ -95,4 +100,3 @@ protected:
 };
 
 #endif // PROTOCOL_H
-

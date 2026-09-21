@@ -377,6 +377,35 @@ void TuyaProtocol::HandleCloudReset() {
     esp_restart();
 }
 
+bool TuyaProtocol::UnbindForWifiReprovisioning() {
+    if (!iot_client_) {
+        ESP_LOGE(TAG, "Cannot unbind: Tuya IoT client is not initialized");
+        return false;
+    }
+
+    // iot_client_reset() destroys the client on success. Stop the MQTT pump
+    // first so it cannot be using the client concurrently.
+    StopMqttPump();
+    CloseAudioChannel(false);
+
+    char error_code[IOT_ATOP_ERROR_CODE_LEN] = {};
+    int ret = iot_client_reset(iot_client_, IOT_RESET_UNBIND_ONLY,
+                               error_code, sizeof(error_code));
+    if (ret != OPRT_OK) {
+        ESP_LOGE(TAG, "Cloud unbind failed: %d, errorCode=%s", ret, error_code);
+        // Reset failure leaves the client valid, so resume receiving cloud
+        // messages and keep all local credentials for a later retry.
+        if (!StartMqttPump()) {
+            ESP_LOGE(TAG, "Failed to restart MQTT pump after cloud unbind failure");
+        }
+        return false;
+    }
+
+    // iot_client_reset() released the client. The caller may now erase NVS.
+    iot_client_ = nullptr;
+    return true;
+}
+
 bool TuyaProtocol::FetchToken() {
     token_ = (char *)calloc(1, 4096);
     if (!token_) return false;

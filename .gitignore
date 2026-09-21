@@ -1,6 +1,14 @@
 tmp/
 components/
 managed_components/
+!components/
+components/*
+!components/esp-agentic-kit/
+!components/esp-agentic-kit/**
+!components/78__esp-wifi-connect/
+!components/78__esp-wifi-connect/**
+components/78__esp-wifi-connect/.component_hash
+components/78__esp-wifi-connect/CHECKSUMS.json
 build/
 dist/
 .vscode/

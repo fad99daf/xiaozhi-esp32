@@ -35,6 +35,13 @@ static const char *TAG = "WifiBoard";
 // Connection timeout in seconds
 static constexpr int CONNECT_TIMEOUT_SEC = 60;
 
+#if CONFIG_TUYA_BLE_PROVISIONING
+static constexpr int kTuyaReprovisionMaxAttempts = 3;
+static constexpr uint64_t kTuyaReprovisionTimeoutUs = 10 * 1000000ULL;
+static constexpr char kTuyaReprovisionPendingKey[] = "reprov_pending";
+static constexpr char kTuyaReprovisionAttemptKey[] = "reprov_attempt";
+#endif
+
 WifiBoard::WifiBoard() {
     // Create connection timeout timer
     esp_timer_create_args_t timer_args = {
@@ -45,12 +52,27 @@ WifiBoard::WifiBoard() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&timer_args, &connect_timer_);
+
+#if CONFIG_TUYA_BLE_PROVISIONING
+    esp_timer_create_args_t reprovision_timer_args = {
+        .callback = OnTuyaReprovisionTimeout,
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "tuya_unbind_timeout",
+        .skip_unhandled_events = true
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&reprovision_timer_args, &reprovision_timeout_timer_));
+#endif
 }
 
 WifiBoard::~WifiBoard() {
     if (connect_timer_) {
         esp_timer_stop(connect_timer_);
         esp_timer_delete(connect_timer_);
+    }
+    if (reprovision_timeout_timer_) {
+        esp_timer_stop(reprovision_timeout_timer_);
+        esp_timer_delete(reprovision_timeout_timer_);
     }
 }
 
@@ -120,6 +142,17 @@ void WifiBoard::TryWifiConnect() {
 
         BleProvResult ble_result;
         if (TuyaBleProvision(-1, ble_result)) {
+            // An SSID is limited to 32 octets by Wi-Fi.  Keep this validation
+            // at the platform boundary even though BLE provisioning has its
+            // own parser, because credentials can originate from other paths.
+            if (ble_result.ssid.size() > 32) {
+                ESP_LOGE(TAG, "Provisioned SSID is %u bytes; WiFi supports at most 32 bytes",
+                    static_cast<unsigned>(ble_result.ssid.size()));
+                GetDisplay()->ShowNotification("WiFi名称过长（最多32字节）", 3000);
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                esp_restart();
+            }
+
             ssid_manager.AddSsid(ble_result.ssid, ble_result.password);
             esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL);
             WifiManager::GetInstance().StartStation();
@@ -223,6 +256,35 @@ void WifiBoard::OnWifiConnectTimeout(void* arg) {
 #endif
 }
 
+void WifiBoard::OnTuyaReprovisionTimeout(void* arg) {
+#if CONFIG_TUYA_BLE_PROVISIONING
+    (void)arg;
+    ESP_LOGE(TAG, "Tuya unbind attempt %d timed out; rebooting for recovery",
+        Settings("tuya", false).GetInt(kTuyaReprovisionAttemptKey));
+    // Do not attempt cleanup here. The unbind call may still own network
+    // resources; the persisted marker makes the next boot retry safely.
+    esp_restart();
+#else
+    (void)arg;
+#endif
+}
+
+void WifiBoard::ForceLocalTuyaReprovisioning(const char* notification) {
+#if CONFIG_TUYA_BLE_PROVISIONING
+    ESP_LOGW(TAG, "Clearing local Tuya and WiFi state for BLE reprovisioning");
+    {
+        Settings settings("tuya", true);
+        settings.EraseAll();
+    }
+    SsidManager::GetInstance().Clear();
+    GetDisplay()->ShowNotification(notification);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+#else
+    (void)notification;
+#endif
+}
+
 void WifiBoard::StartWifiConfigMode() {
     in_config_mode_ = true;
     // Transition to wifi configuring state
@@ -265,21 +327,64 @@ void WifiBoard::StartWifiConfigMode() {
 
 void WifiBoard::EnterWifiConfigMode() {
     ESP_LOGI(TAG, "EnterWifiConfigMode called");
+    auto& app = Application::GetInstance();
 #if CONFIG_TUYA_BLE_PROVISIONING
-    // Clear Tuya on-boarded credentials and WiFi so BLE provisioning re-runs on next boot
+    if (reprovisioning_) {
+        ESP_LOGW(TAG, "Tuya reprovisioning is already in progress");
+        return;
+    }
+    reprovisioning_ = true;
+
+    int attempt = 0;
     {
         Settings settings("tuya", true);
-        settings.EraseAll();
+        if (settings.GetString("devid").empty()) {
+            ForceLocalTuyaReprovisioning(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
+            return;
+        }
+
+        const int previous_attempts = settings.GetInt(kTuyaReprovisionAttemptKey);
+        if (settings.GetBool(kTuyaReprovisionPendingKey) &&
+            previous_attempts >= kTuyaReprovisionMaxAttempts) {
+            ESP_LOGW(TAG, "Tuya unbind was not confirmed after %d attempts; forcing local reprovisioning",
+                previous_attempts);
+            ForceLocalTuyaReprovisioning("云端解绑未确认，强制进入配网");
+            return;
+        }
+
+        attempt = previous_attempts + 1;
+        // Commit this before the synchronous SDK call: the call can block even
+        // after the cloud has accepted the unbind request.
+        settings.SetBool(kTuyaReprovisionPendingKey, true);
+        settings.SetInt(kTuyaReprovisionAttemptKey, attempt);
     }
-    SsidManager::GetInstance().Clear();
-    GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
+
+    ESP_LOGI(TAG, "Requesting Tuya cloud unbind (attempt %d/%d)", attempt,
+        kTuyaReprovisionMaxAttempts);
+    GetDisplay()->ShowNotification("正在解绑云端设备...");
+    ESP_ERROR_CHECK(esp_timer_start_once(reprovision_timeout_timer_, kTuyaReprovisionTimeoutUs));
+    const bool unbound = app.UnbindTuyaForWifiReprovisioning();
+    esp_timer_stop(reprovision_timeout_timer_);
+
+    if (unbound) {
+        ForceLocalTuyaReprovisioning(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
+        return;
+    }
+
+    if (attempt >= kTuyaReprovisionMaxAttempts) {
+        ESP_LOGW(TAG, "Tuya unbind failed after %d attempts; forcing local reprovisioning", attempt);
+        ForceLocalTuyaReprovisioning("云端解绑未确认，强制进入配网");
+        return;
+    }
+
+    ESP_LOGW(TAG, "Tuya unbind attempt %d failed; rebooting to retry", attempt);
+    GetDisplay()->ShowNotification("解绑失败，重启后重试...");
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
     return;
 #endif
     GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
 
-    auto& app = Application::GetInstance();
     auto state = app.GetDeviceState();
 
     if (state == kDeviceStateSpeaking || state == kDeviceStateListening || state == kDeviceStateIdle) {
@@ -314,6 +419,21 @@ void WifiBoard::EnterWifiConfigMode() {
     WifiManager::GetInstance().StopStation();
 
     StartWifiConfigMode();
+}
+
+bool WifiBoard::ResumePendingTuyaReprovisioning() {
+#if CONFIG_TUYA_BLE_PROVISIONING
+    Settings settings("tuya", false);
+    if (!settings.GetBool(kTuyaReprovisionPendingKey) || settings.GetString("devid").empty()) {
+        return false;
+    }
+
+    ESP_LOGW(TAG, "Resuming pending Tuya reprovisioning after recovery reboot");
+    EnterWifiConfigMode();
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool WifiBoard::IsInWifiConfigMode() const {

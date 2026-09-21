@@ -34,6 +34,7 @@ public:
     void SendStopListening() override;
     void SendAbortSpeaking(AbortReason reason) override;
     void SendMcpMessage(const std::string& payload) override;
+    bool UnbindForWifiReprovisioning() override;
 
 private:
     iot_client_t* iot_client_ = nullptr;

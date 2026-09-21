@@ -133,6 +133,16 @@ private:
             app.ToggleChatState();
         });
 
+        // Re-provisioning a bound device needs cloud connectivity so the
+        // common flow can release its Tuya App binding before local state is
+        // erased. Button callbacks run in esp_timer, so the teardown must
+        // run on the application main task rather than its small timer stack.
+        boot_button_.OnLongPress([this]() {
+            Application::GetInstance().Schedule([this]() {
+                EnterWifiConfigMode();
+            });
+        });
+
 #if CONFIG_USE_DEVICE_AEC
         boot_button_.OnDoubleClick([this]() {
             auto& app = Application::GetInstance();
