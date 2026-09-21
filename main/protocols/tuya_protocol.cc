@@ -111,24 +111,9 @@ static char *json_get_object(const char *json, const char *key)
     return nullptr;
 }
 
-// --- IoT SDK log callback ---
-
-static void iot_log_cb(log_level_t level, const char *fmt, va_list args)
-{
-    char buf[256];
-    vsnprintf(buf, sizeof(buf), fmt, args);
-    switch (level) {
-        case LOG_ERROR: ESP_LOGE("IOT", "%s", buf); break;
-        case LOG_WARN:  ESP_LOGW("IOT", "%s", buf); break;
-        case LOG_INFO:  ESP_LOGI("IOT", "%s", buf); break;
-        default:        ESP_LOGD("IOT", "%s", buf); break;
-    }
-}
-
 static void EnsureSdkInitialized() {
     static bool initialized = false;
     if (initialized) return;
-    log_set_handler(iot_log_cb);
     iot_init(tai_pal_freertos());
     initialized = true;
 }
@@ -549,11 +534,6 @@ bool TuyaProtocol::BuildTaiContext() {
 
     ESP_LOGI(TAG, "TAI context built (%uKB in %s)", (unsigned)(sz / 1024),
              esp_ptr_external_ram(ctx_mem_) ? "PSRAM" : "internal");
-
-    /* Enable agentic-kit debug logging (level 4 = DEBUG).
-     * This logs t_send(), t_recv() entries, packet dispatch, etc.
-     * at the agentic-kit layer using the project-wide log facade. */
-    tai_set_log_level(4);
 
     return true;
 }

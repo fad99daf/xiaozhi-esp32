@@ -8,7 +8,6 @@ extern "C" {
 #include "tuya_ble_nimble.h"
 #include "esp_bt.h"
 #include "iot_client.h"
-#include "log.h"
 extern const pal_t *tai_pal_freertos(void);
 }
 
@@ -22,32 +21,6 @@ extern const pal_t *tai_pal_freertos(void);
 
 static EventGroupHandle_t s_event_group;
 static BleProvResult s_result;
-
-// Keep BLE protocol traces visible in INFO builds without enabling SDK-wide
-// debug output. SDK hex dumps and WiFi JSON can contain pairing secrets.
-static void ble_sdk_log_cb(log_level_t level, const char *fmt, va_list args)
-{
-    if (strncmp(fmt, "[ble] HEX(", 10) == 0) return;
-    if (strcmp(fmt, "[ble] [PROTO] WiFi JSON: %s") == 0) {
-        ESP_LOGI("tuya_sdk", "[ble] [PROTO] WiFi JSON received (contents redacted)");
-        return;
-    }
-    if (strcmp(fmt, "[ble] JSON parse failed: %s") == 0) {
-        ESP_LOGE("tuya_sdk", "[ble] JSON parse failed (contents redacted)");
-        return;
-    }
-    if (level == LOG_DEBUG && strncmp(fmt, "[ble] ", 6) == 0) {
-        level = LOG_INFO;
-    }
-    char buf[256];
-    vsnprintf(buf, sizeof(buf), fmt, args);
-    switch (level) {
-        case LOG_ERROR: ESP_LOGE("tuya_sdk", "%s", buf); break;
-        case LOG_WARN:  ESP_LOGW("tuya_sdk", "%s", buf); break;
-        case LOG_INFO:  ESP_LOGI("tuya_sdk", "%s", buf); break;
-        default:        ESP_LOGD("tuya_sdk", "%s", buf); break;
-    }
-}
 
 static void ble_prov_callback(const tuya_ble_wifi_creds_t *creds)
 {
@@ -102,8 +75,6 @@ bool TuyaBleProvision(int timeout_ms, BleProvResult& result)
     // building the WiFi-list JSON. Must run before tuya_ble_nimble_start.
     static bool sdk_initialized = false;
     if (!sdk_initialized) {
-        log_set_handler(ble_sdk_log_cb);
-        log_set_level(LOG_DEBUG);
         if (iot_init(tai_pal_freertos()) != 0) {
             ESP_LOGE(TAG, "iot_init failed");
             vEventGroupDelete(s_event_group);
