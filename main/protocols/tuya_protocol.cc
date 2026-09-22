@@ -1,5 +1,6 @@
 #include "tuya_protocol.h"
 #include "tuya_auth.h"
+#include "tuya_version_report_state.h"
 #include "settings.h"
 #include "application.h"
 #include "board.h"
@@ -154,6 +155,10 @@ bool TuyaProtocol::InitIotClient() {
         cfg.mqtt_disable_tls = false;
         cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
         cfg.sw_ver = esp_app_get_description()->version;
+        bool version_report_pending = TuyaVersionReportState::ShouldReport(cfg.sw_ver);
+        cfg.skip_version_report = !version_report_pending;
+        ESP_LOGI(TAG, "%s version/metadata during IoT client initialization",
+                 version_report_pending ? "Reporting" : "Skipping");
         // Cloud-initiated device-remove (protocol 11) notice: subscribing to it
         // keeps the client in charge of consuming the push, and the pump task
         // started below is what actually delivers it (iot_client_process).
@@ -162,6 +167,9 @@ bool TuyaProtocol::InitIotClient() {
 
         iot_client_ = iot_client_init(&cfg);
         if (iot_client_) {
+            if (version_report_pending && !TuyaVersionReportState::MarkReported(cfg.sw_ver)) {
+                ESP_LOGW(TAG, "Could not persist completed version report; reporting will retry");
+            }
             ESP_LOGI(TAG, "IoT client initialized from NVS (devid=%s)", nvs_devid.c_str());
             StartMqttPump();
             return true;
@@ -193,6 +201,8 @@ bool TuyaProtocol::OnBoardWithToken(const std::string& token) {
     cfg.mqtt_disable_tls = false;
     cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
     cfg.sw_ver = esp_app_get_description()->version;
+    cfg.skip_version_report = false;
+    ESP_LOGI(TAG, "Reporting version/metadata during first binding");
 
     iot_client_t* client = iot_client_init_on_boarding_with_token(&cfg, token.c_str());
     if (!client) {
@@ -208,6 +218,9 @@ bool TuyaProtocol::OnBoardWithToken(const std::string& token) {
         settings.SetString("local_key", client->local_key);
         settings.SetInt("region", (int32_t)client->region);
         settings.SetInt("env", (int32_t)client->env);
+    }
+    if (!TuyaVersionReportState::MarkReported(cfg.sw_ver)) {
+        ESP_LOGW(TAG, "Could not persist completed first-binding version report");
     }
 
     ESP_LOGI(TAG, "On-boarded successfully, devid=%s", client->devid);

@@ -38,7 +38,7 @@ std::string Settings::GetString(const std::string& key, const std::string& defau
 }
 
 void Settings::SetString(const std::string& key, const std::string& value) {
-    if (read_write_) {
+    if (read_write_ && nvs_handle_ != 0) {
         ESP_ERROR_CHECK(nvs_set_str(nvs_handle_, key.c_str(), value.c_str()));
         dirty_ = true;
     } else {
@@ -59,7 +59,7 @@ int32_t Settings::GetInt(const std::string& key, int32_t default_value) {
 }
 
 void Settings::SetInt(const std::string& key, int32_t value) {
-    if (read_write_) {
+    if (read_write_ && nvs_handle_ != 0) {
         ESP_ERROR_CHECK(nvs_set_i32(nvs_handle_, key.c_str(), value));
         dirty_ = true;
     } else {
@@ -80,7 +80,7 @@ bool Settings::GetBool(const std::string& key, bool default_value) {
 }
 
 void Settings::SetBool(const std::string& key, bool value) {
-    if (read_write_) {
+    if (read_write_ && nvs_handle_ != 0) {
         ESP_ERROR_CHECK(nvs_set_u8(nvs_handle_, key.c_str(), value ? 1 : 0));
         dirty_ = true;
     } else {
@@ -89,7 +89,7 @@ void Settings::SetBool(const std::string& key, bool value) {
 }
 
 void Settings::EraseKey(const std::string& key) {
-    if (read_write_) {
+    if (read_write_ && nvs_handle_ != 0) {
         auto ret = nvs_erase_key(nvs_handle_, key.c_str());
         if (ret != ESP_ERR_NVS_NOT_FOUND) {
             ESP_ERROR_CHECK(ret);
@@ -101,7 +101,7 @@ void Settings::EraseKey(const std::string& key) {
 }
 
 void Settings::EraseAll() {
-    if (read_write_) {
+    if (read_write_ && nvs_handle_ != 0) {
         ESP_ERROR_CHECK(nvs_erase_all(nvs_handle_));
         dirty_ = true;
     } else {
