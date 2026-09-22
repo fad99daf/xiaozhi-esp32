@@ -1,3 +1,7 @@
 [submodule "components/esp-agentic-kit"]
 	path = components/esp-agentic-kit
 	url = https://github.com/sedawwk/esp-agentic-kit.git
+[submodule "components/78__esp-wifi-connect"]
+	path = components/78__esp-wifi-connect
+	url = https://github.com/xiongzh2000/esp-wifi-connect.git
+	branch = codex/wifi-compat
