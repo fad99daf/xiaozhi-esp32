@@ -14,7 +14,9 @@
 #include "tuya_version_report_state.h"
 
 #include <cstring>
+#include <new>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <esp_app_desc.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
@@ -73,7 +75,13 @@ void Application::Initialize() {
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
 
     // Setup the audio service
+    ESP_LOGI(TAG, "[MEM] before board codec: int_free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     auto codec = board.GetAudioCodec();
+    ESP_LOGI(TAG, "[MEM] after board codec: int_free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     audio_service_.Initialize(codec);
     audio_service_.Start();
 
@@ -295,6 +303,10 @@ void Application::HandleNetworkDisconnectedEvent() {
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
     if (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+        {
+            std::lock_guard<std::mutex> lock(tts_mutex_);
+            CancelTtsLocked();
+        }
         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
         protocol_->CloseAudioChannel();
     }
@@ -562,27 +574,56 @@ bool Application::InitializeProtocol() {
     });
 
     protocol_->OnNetworkError([this](const std::string& message) {
+        std::lock_guard<std::mutex> lock(tts_mutex_);
+        auto generation = CancelTtsLocked();
         audio_service_.FlushAudioQueues();
-        last_error_message_ = message;
-        xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
+        Schedule([this, generation, message]() {
+            std::lock_guard<std::mutex> lock(tts_mutex_);
+            if (generation != tts_generation_) return;
+            SetDeviceState(kDeviceStateIdle);
+            Alert(Lang::Strings::ERROR, message.c_str(), "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
+        });
     });
     
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking && !aborted_) {
-            // Non-blocking: the TAI receive thread must never block here, otherwise
-            // CHAT_BREAK events cannot be delivered for barge-in.
-            // The decode queue is sized large enough (24s) to absorb server bursts.
-            if (!audio_service_.PushPacketToDecodeQueue(std::move(packet), false)) {
+        bool admitted;
+        {
+            std::lock_guard<std::mutex> lock(tts_mutex_);
+            // A queued speaking transition is admission for its incoming audio;
+            // otherwise the first TTS packets can be rejected before the main
+            // task has processed tts/start.
+            admitted = !aborted_ &&
+                (GetDeviceState() == kDeviceStateSpeaking || tts_start_pending_);
+        }
+        if (admitted) {
+            // No-PSRAM Tuya targets use TCP receive backpressure: one network
+            // message can expand into more Opus frames than the queue holds, so
+            // wait for playback to drain within that message rather than drop.
+            // Abort/reset/stop cancel the wait. Larger queues stay non-blocking
+            // so inbound barge-in events stay responsive on S3.
+#if CONFIG_PROTOCOL_TUYA && (CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6)
+            constexpr bool wait_for_decode = true;
+#else
+            constexpr bool wait_for_decode = false;
+#endif
+            const auto output_generation = audio_service_.OutputGeneration();
+            if (!audio_service_.PushPacketToDecodeQueue(std::move(packet), wait_for_decode)) {
                 static int overflow_count = 0;
                 if (++overflow_count % 50 == 1) {
                     ESP_LOGW(TAG, "[BARGE-IN] Decode queue overflow, dropping packet (count=%d)", overflow_count);
                 }
             }
+            // If this packet waited through an abort/reset, do not deliver the
+            // callback after the push failed; the queue generation has changed.
+            if (wait_for_decode &&
+                output_generation != audio_service_.OutputGeneration()) {
+                return;
+            }
         } else {
             static int reject_count = 0;
             if (++reject_count % 50 == 1) {
                 ESP_LOGD(TAG, "[BARGE-IN] Audio rejected: state=%d aborted=%d, count=%d",
-                         (int)GetDeviceState(), (int)aborted_, reject_count);
+                         (int)GetDeviceState(), (int)aborted_.load(), reject_count);
             }
         }
     });
@@ -597,7 +638,11 @@ bool Application::InitializeProtocol() {
     
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
-        Schedule([this]() {
+        std::lock_guard<std::mutex> lock(tts_mutex_);
+        auto generation = CancelTtsLocked();
+        Schedule([this, generation]() {
+            std::lock_guard<std::mutex> lock(tts_mutex_);
+            if (generation != tts_generation_) return;
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
@@ -608,14 +653,26 @@ bool Application::InitializeProtocol() {
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
         if (strcmp(type->valuestring, "tts") == 0) {
+            std::lock_guard<std::mutex> lock(tts_mutex_);
+            auto generation = tts_generation_;
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
-                Schedule([this]() {
+                generation = ++tts_generation_;
+                tts_start_pending_ = true;
+                audio_service_.CancelDrainWait();
+                Schedule([this, generation]() {
+                    std::lock_guard<std::mutex> lock(tts_mutex_);
+                    if (generation != tts_generation_) return;
+                    tts_start_pending_ = false;
+                    // Reset here, not in the later state event which may follow cancellation.
+                    audio_service_.ResetDecoder();
                     aborted_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
-                Schedule([this]() {
+                Schedule([this, generation]() {
+                    std::lock_guard<std::mutex> lock(tts_mutex_);
+                    if (generation != tts_generation_ || aborted_) return;
                     if (GetDeviceState() == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
@@ -625,20 +682,30 @@ bool Application::InitializeProtocol() {
                     }
                 });
             } else if (strcmp(state->valuestring, "abort") == 0) {
-                // Chat-break: user interrupted TTS -- flush immediately.
+                // Chat-break / MQTT interrupt: user interrupted TTS — flush now.
                 ESP_LOGW(TAG, "[BARGE-IN] TTS abort received, flushing audio (state=%d)", (int)GetDeviceState());
-                aborted_ = true;
-                audio_service_.AbortOutput();
-                Board::GetInstance().GetAudioCodec()->ClearOutputBuffer();
-                Schedule([this]() {
+                generation = CancelTtsLocked();
+                Schedule([this, generation]() {
+                    std::lock_guard<std::mutex> lock(tts_mutex_);
+                    if (generation != tts_generation_) return;
                     ESP_LOGI(TAG, "[BARGE-IN] Transitioning to listening after abort");
                     SetDeviceState(kDeviceStateListening);
+                });
+            } else if (strcmp(state->valuestring, "stream_end") == 0) {
+                // Half-duplex: wait for software playback to drain before reopening
+                // the microphone, with the existing 50ms (not guaranteed) DMA allowance.
+                Schedule([this, generation]() {
+                    std::lock_guard<std::mutex> lock(tts_mutex_);
+                    if (generation != tts_generation_ || aborted_) return;
+                    AwaitTtsDrain(generation);
                 });
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring)]() {
+                    Schedule([this, generation, display, message = std::string(text->valuestring)]() {
+                        std::lock_guard<std::mutex> lock(tts_mutex_);
+                        if (generation != tts_generation_ || aborted_) return;
                         display->SetChatMessage("assistant", message.c_str());
                     });
                 }
@@ -1018,7 +1085,9 @@ void Application::HandleStateChangedEvent() {
                 audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
             }
             break;
-        case kDeviceStateSpeaking:
+        case kDeviceStateSpeaking: {
+            std::lock_guard<std::mutex> lock(tts_mutex_);
+            if (aborted_) break;
             display->SetStatus(Lang::Strings::SPEAKING);
 
             if (listening_mode_ != kListeningModeRealtime) {
@@ -1026,8 +1095,8 @@ void Application::HandleStateChangedEvent() {
                 // Only AFE wake word can be detected in speaking mode
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             }
-            audio_service_.ResetDecoder();
             break;
+        }
         case kDeviceStateWifiConfiguring:
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(false);
@@ -1046,13 +1115,71 @@ void Application::Schedule(std::function<void()>&& callback) {
     xEventGroupSetBits(event_group_, MAIN_EVENT_SCHEDULE);
 }
 
+uint64_t Application::CancelTtsLocked() {
+    ++tts_generation_;
+    aborted_ = true;
+    tts_start_pending_ = false;
+    audio_service_.AbortOutput();
+    audio_service_.CancelDrainWait();
+    Board::GetInstance().GetAudioCodec()->ClearOutputBuffer();
+    return tts_generation_;
+}
+
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGW(TAG, "[BARGE-IN] AbortSpeaking called (reason=%d, state=%d)", reason, (int)GetDeviceState());
-    aborted_ = true;
-    audio_service_.AbortOutput();
-    Board::GetInstance().GetAudioCodec()->ClearOutputBuffer();
+    {
+        std::lock_guard<std::mutex> lock(tts_mutex_);
+        auto generation = CancelTtsLocked();
+        // Local cancellation may suppress server completion, so finish locally.
+        Schedule([this, generation]() {
+            std::lock_guard<std::mutex> lock(tts_mutex_);
+            if (generation != tts_generation_ || GetDeviceState() != kDeviceStateSpeaking) return;
+            SetDeviceState(listening_mode_ == kListeningModeManualStop
+                           ? kDeviceStateIdle : kDeviceStateListening);
+        });
+    }
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
+    }
+}
+
+// Wait off the main loop for software queues, then allow 50ms for hardware.
+// This allowance is not a guarantee that I2S DMA has finished playing.
+void Application::AwaitTtsDrain(uint64_t generation) {
+    if (GetDeviceState() != kDeviceStateSpeaking) return;
+    if (tts_drain_task_handle_ != nullptr && tts_drain_generation_ == generation) return;
+
+    struct DrainContext {
+        Application* app;
+        uint64_t generation;
+    };
+    auto context = new (std::nothrow) DrainContext{this, generation};
+    tts_drain_generation_ = generation;
+    if (!context || xTaskCreate([](void* arg) {
+        auto context = static_cast<DrainContext*>(arg);
+        auto app = context->app;
+        auto generation = context->generation;
+        delete context;
+        app->audio_service_.WaitForPlaybackQueueEmpty();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        app->Schedule([app, generation]() {
+            std::lock_guard<std::mutex> lock(app->tts_mutex_);
+            // Only the main task owns the handle; an older waiter cannot clear a new one.
+            if (app->tts_drain_generation_ != generation) return;
+            app->tts_drain_task_handle_ = nullptr;
+            if (generation != app->tts_generation_ || app->aborted_) return;
+            if (app->GetDeviceState() == kDeviceStateSpeaking) {
+                app->SetDeviceState(app->listening_mode_ == kListeningModeManualStop
+                                    ? kDeviceStateIdle : kDeviceStateListening);
+            }
+        });
+        vTaskDelete(NULL);
+    }, "tts_drain", 3072, context, 2, &tts_drain_task_handle_) != pdPASS) {
+        delete context;
+        tts_drain_task_handle_ = nullptr;
+        ESP_LOGE(TAG, "Failed to create TTS drain task");
+        CancelTtsLocked();
+        SetDeviceState(kDeviceStateIdle);
     }
 }
 

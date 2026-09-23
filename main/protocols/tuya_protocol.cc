@@ -112,24 +112,14 @@ static char *json_get_object(const char *json, const char *key)
     return nullptr;
 }
 
-// --- IoT SDK log callback ---
-
-static void iot_log_cb(log_level_t level, const char *fmt, va_list args)
-{
-    char buf[256];
-    vsnprintf(buf, sizeof(buf), fmt, args);
-    switch (level) {
-        case LOG_ERROR: ESP_LOGE("IOT", "%s", buf); break;
-        case LOG_WARN:  ESP_LOGW("IOT", "%s", buf); break;
-        case LOG_INFO:  ESP_LOGI("IOT", "%s", buf); break;
-        default:        ESP_LOGD("IOT", "%s", buf); break;
-    }
-}
+// --- SDK init ---
+//
+// SDK logging is compile-time configured (agentic_kit_config.h remaps
+// AGENTIC_KIT_LOG to ESP_LOGx); there is no runtime log handler or level.
 
 static void EnsureSdkInitialized() {
     static bool initialized = false;
     if (initialized) return;
-    log_set_handler(iot_log_cb);
     iot_init(tai_pal_freertos());
     initialized = true;
 }
@@ -168,6 +158,10 @@ bool TuyaProtocol::InitIotClient() {
         cfg.region = (iot_region_t)tuya_nvs.GetInt("region", (int32_t)AY);
         cfg.env = (iot_env_t)tuya_nvs.GetInt("env", (int32_t)PROD);
         cfg.mqtt_disable_tls = false;
+        // Defer the MQTT connect until after the session token is fetched
+        // (HTTPS) — keeps the two TLS connections from overlapping their peak
+        // heap usage on no-PSRAM targets. Start()/StartMqttPump connects later.
+        cfg.mqtt_disable_auto_connect = true;
         cfg.cert_bundle_attach = (tls_cert_bundle_attach_fn)esp_crt_bundle_attach;
         cfg.sw_ver = esp_app_get_description()->version;
         bool version_report_pending = TuyaVersionReportState::ShouldReport(cfg.sw_ver);
@@ -186,7 +180,6 @@ bool TuyaProtocol::InitIotClient() {
                 ESP_LOGW(TAG, "Could not persist completed version report; reporting will retry");
             }
             ESP_LOGI(TAG, "IoT client initialized from NVS (devid=%s)", nvs_devid.c_str());
-            StartMqttPump();
             return true;
         }
         ESP_LOGW(TAG, "NVS credentials failed, trying on-boarding...");
@@ -240,8 +233,10 @@ bool TuyaProtocol::OnBoardWithToken(const std::string& token) {
 
     ESP_LOGI(TAG, "On-boarded successfully, devid=%s", client->devid);
 
-    // don't Free the client —  the mqtt is used by data point management
-    //iot_client_deinit(client);
+    // Credentials are persisted to NVS above; the transient on-boarding client
+    // has no owner after this returns, so free it. The audio session rebuilds
+    // the client from NVS in InitIotClient().
+    iot_client_deinit(client);
     return true;
 }
 
@@ -261,12 +256,32 @@ void TuyaProtocol::OnCloudReset(iot_reset_type_t type, void* user) {
     self->reset_pending_ = true;  // flag only; handled by MqttPumpLoop
 }
 
+bool TuyaProtocol::ConnectMqtt() {
+#if !CONFIG_IDF_TARGET_ESP32C3
+    // Register independently of mode; SendStartListening selects it per session.
+    iot_ai_ctrl_set_callback(iot_client_, OnAiCtrlCb, this);
+#endif
+    if (iot_client_connect(iot_client_) != OPRT_OK) {
+        ESP_LOGE(TAG, "MQTT connect failed");
+        return false;
+    }
+    return StartMqttPump();
+}
+
 bool TuyaProtocol::StartMqttPump() {
     if (mqtt_pump_running_.exchange(true)) return true;
 
+#if CONFIG_SPIRAM
     constexpr size_t kMqttPumpStackWords = 6144;
+#else
+    constexpr size_t kMqttPumpStackWords = 4096;  // 16 KB; internal RAM on C3
+#endif
     mqtt_pump_stack_ = static_cast<StackType_t*>(
         heap_caps_malloc(kMqttPumpStackWords * sizeof(StackType_t), MALLOC_CAP_SPIRAM));
+    if (!mqtt_pump_stack_) {  // no PSRAM (C3-class): fall back to internal RAM
+        mqtt_pump_stack_ = static_cast<StackType_t*>(
+            heap_caps_malloc(kMqttPumpStackWords * sizeof(StackType_t), MALLOC_CAP_INTERNAL));
+    }
     mqtt_pump_task_buffer_ = static_cast<StaticTask_t*>(
         heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL));
     mqtt_pump_done_ = xSemaphoreCreateBinaryStatic(&mqtt_pump_done_buffer_);
@@ -406,7 +421,7 @@ bool TuyaProtocol::FetchToken() {
 }
 
 bool TuyaProtocol::ParseToken() {
-    memset(&conn_params_, 0, sizeof(conn_params_));
+    conn_params_ = ConnParams{};
 
     // Try base64 decode
     char *json = nullptr;
@@ -482,12 +497,15 @@ bool TuyaProtocol::ParseToken() {
 
 bool TuyaProtocol::BuildTaiContext() {
     size_t sz = tai_ctx_size();
-    // Allocate the TAI context in PSRAM rather than internal RAM.
-    // The context size is printed below; after the scatter-gather redesign
-    // it is ~37 KB. PSRAM is safe (no ISR/cache-disabled access).
+    // Prefer PSRAM for the TAI context (no ISR/cache-disabled access). On
+    // C3-class targets without PSRAM, fall back to internal RAM — the context
+    // buffers are already shrunk via AGENTIC_KIT_TAI_* (root CMakeLists.txt).
     ctx_mem_ = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ctx_mem_) {  // no PSRAM: fall back to internal RAM
+        ctx_mem_ = heap_caps_malloc(sz, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
     if (!ctx_mem_) {
-        ESP_LOGE(TAG, "Failed to allocate %u bytes for TAI context in PSRAM", (unsigned)sz);
+        ESP_LOGE(TAG, "Failed to allocate %u bytes for TAI context", (unsigned)sz);
         return false;
     }
 
@@ -521,6 +539,7 @@ bool TuyaProtocol::BuildTaiContext() {
     cfg.on_text = OnTextCb;
     cfg.on_event = OnEventCb;
     cfg.on_disconnect = OnDisconnectCb;
+    cfg.on_flow_control = OnFlowControlCb;
     cfg.user_data = this;
 
     ctx_ = tai_ctx_init(ctx_mem_, &cfg);
@@ -534,10 +553,7 @@ bool TuyaProtocol::BuildTaiContext() {
     ESP_LOGI(TAG, "TAI context built (%uKB in %s)", (unsigned)(sz / 1024),
              esp_ptr_external_ram(ctx_mem_) ? "PSRAM" : "internal");
 
-    /* Enable agentic-kit debug logging (level 4 = DEBUG).
-     * This logs t_send(), t_recv() entries, packet dispatch, etc.
-     * at the agentic-kit layer using the project-wide log facade. */
-    tai_set_log_level(4);
+    /* SDK log verbosity is compile-time (AGENTIC_KIT_LOG_LEVEL); no runtime knob. */
 
     return true;
 }
@@ -569,6 +585,9 @@ bool TuyaProtocol::RefreshTaiContext() {
     if (!FetchToken()) return false;
 
     if (!ParseToken()) return false;
+    free(token_);
+    token_ = nullptr;
+    if (!ConnectMqtt()) return false;
     if (!BuildTaiContext()) return false;
     return true;
 }
@@ -603,16 +622,17 @@ bool TuyaProtocol::Start() {
     if (!FetchToken()) return false;
     log_heap_delta("FetchToken", before_int, before_ps);
 
-    // Disconnect IoT MQTT client to free ~30KB of internal TLS buffers.
-    // The client is only needed to fetch the session token; the TAI audio
-    // channel uses its own TLS connection.
-    before_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    before_ps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    //iot_client_deinit(iot_client_);
-    //iot_client_ = nullptr;
-    log_heap_delta("iot_client_deinit (freed)", before_int, before_ps);
-
     if (!ParseToken()) return false;
+
+    // conn_params_ now holds everything BuildTaiContext needs; release the raw
+    // session token (it stays in NVS-free heap for the whole session otherwise).
+    if (token_) {
+        free(token_);
+        token_ = nullptr;
+    }
+
+    // Token HTTPS completes before connecting MQTT to limit peak TLS memory.
+    if (!ConnectMqtt()) return false;
 
     before_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     before_ps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -643,6 +663,7 @@ bool TuyaProtocol::OpenAudioChannel() {
 
     size_t before_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     size_t before_ps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    ResetReceiveState();
     int rc = tai_connect(ctx_);
     if (rc != TAI_OK) {
         connect_fail_count_++;
@@ -660,9 +681,6 @@ bool TuyaProtocol::OpenAudioChannel() {
     connected_ = true;
     session_active_ = true;
     is_first_audio_packet_ = true;
-    has_received_first_nlg_ = false;
-    audio_recv_count_ = 0;
-    audio_reassembly_buf_.clear();
     audio_batch_buf_.clear();
     audio_batch_solo_next_ = true;
 
@@ -672,12 +690,18 @@ bool TuyaProtocol::OpenAudioChannel() {
 }
 
 void TuyaProtocol::CloseAudioChannel(bool send_goodbye) {
-    if (!session_active_ && !disconnect_cleanup_pending_) return;
+    if (!session_active_ && !disconnect_cleanup_pending_) {
+        ResetReceiveState();
+        return;
+    }
 
+    // Do not hold ctrl_mutex_ while joining the receive worker.
+    session_active_ = false;
     tai_disconnect(ctx_);
     connected_ = false;
     session_active_ = false;
     disconnect_cleanup_pending_ = false;
+    ResetReceiveState();
 
     // Session is gone — drop any unsent batched frames.
     {
@@ -700,7 +724,10 @@ void TuyaProtocol::SendStartListening(ListeningMode mode) {
         ESP_LOGW(TAG, "SendStartListening: not ready");
         return;
     }
-    has_received_first_nlg_ = false;
+    {
+        std::lock_guard<std::mutex> lock(ctrl_mutex_);
+        realtime_mode_ = mode == kListeningModeRealtime;
+    }
     audio_end_pending_ = false;
 
     std::lock_guard<std::mutex> lock(send_mutex_);
@@ -785,6 +812,10 @@ void TuyaProtocol::SendStopListening() {
 
 void TuyaProtocol::SendAbortSpeaking(AbortReason reason) {
     if (!ctx_ || !session_active_) return;
+    {
+        std::lock_guard<std::mutex> lock(ctrl_mutex_);
+        CancelTurn(false);
+    }
     ESP_LOGW(TAG, "[BARGE-IN] Sending tai_chat_break (reason=%d)", reason);
     std::lock_guard<std::mutex> lock(send_mutex_);
     tai_chat_break(ctx_);
@@ -809,7 +840,7 @@ void TuyaProtocol::OnAudioCb(tai_ctx_t* ctx, const tai_audio_msg_t* msg,
                               void* user) {
     auto self = static_cast<TuyaProtocol*>(user);
     self->HandleAudio(msg->data, msg->len, msg->sample_rate,
-                      msg->frame_duration);
+                      msg->frame_duration, msg->stream_flag, msg->timestamp_ms);
 }
 
 void TuyaProtocol::OnTextCb(tai_ctx_t* ctx, const tai_text_msg_t* msg,
@@ -821,7 +852,11 @@ void TuyaProtocol::OnTextCb(tai_ctx_t* ctx, const tai_text_msg_t* msg,
 void TuyaProtocol::OnEventCb(tai_ctx_t* ctx, const tai_event_msg_t* msg,
                               void* user) {
     auto self = static_cast<TuyaProtocol*>(user);
-    self->HandleEvent(msg->event_type, msg->data, msg->len);
+    if (msg->event_type == TAI_EVT_CHAT_BREAK) {
+        self->HandleEvent(msg->event_type, msg->user_data, msg->user_data_len);
+    } else {
+        self->HandleEvent(msg->event_type, msg->data, msg->len);
+    }
 }
 
 void TuyaProtocol::OnDisconnectCb(tai_ctx_t* ctx,
@@ -832,8 +867,89 @@ void TuyaProtocol::OnDisconnectCb(tai_ctx_t* ctx,
                            msg->connection_alive);
 }
 
+// TAI receive flow control. Called on the TAI worker thread before each recv
+// and between codec frames. Returning 0 pauses parsing/reads, letting lwIP's
+// receive window close (TCP backpressure toward the server). While paused,
+// inbound control frames (CHAT_BREAK) are also delayed — acceptable because a
+// full decode queue means playback is already behind, and S3's urgent
+// interrupts arrive out-of-band over MQTT.
+int TuyaProtocol::OnFlowControlCb(tai_ctx_t* ctx, void* user) {
+    (void)ctx;
+    auto self = static_cast<TuyaProtocol*>(user);
+    std::lock_guard<std::mutex> lock(self->ctrl_mutex_);
+    if (self->interrupt_time_ms_ != 0) return 1;  // drain interrupted bytes
+    return Application::GetInstance().GetAudioService()
+                      .IsDecodeQueueBackpressured() ? 0 : 1;
+}
+
+void TuyaProtocol::OnAiCtrlCb(const char* type, const char* json_data,
+                              size_t data_len, void* user) {
+    auto self = static_cast<TuyaProtocol*>(user);
+    self->HandleAiControl(type, json_data, data_len);
+}
+
+void TuyaProtocol::ResetReceiveState() {
+    std::lock_guard<std::mutex> lock(ctrl_mutex_);
+    response_receiving_ = false;
+    interrupt_time_ms_ = 0;
+    last_interrupt_time_.clear();
+    realtime_mode_ = false;
+    has_received_first_nlg_ = false;
+    first_tts_audio_pending_ = false;
+    audio_recv_count_ = 0;
+    audio_reassembly_buf_.clear();
+}
+
+bool TuyaProtocol::AcceptInterruptTime(const char* data, size_t len, bool tcp) {
+    if (!data || len == 0) return false;
+    if (data[len - 1] == '\0') --len;
+    // cJSON strings cannot represent embedded NULs without truncating them.
+    std::string raw(data, len);
+    if (raw.find('\0') != std::string::npos ||
+        raw.find("\\u0000") != std::string::npos) return false;
+    const char* end = nullptr;
+    cJSON* root = cJSON_ParseWithLengthOpts(data, len, &end, false);
+    if (!root) return false;
+    while (end < data + len && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) ++end;
+    cJSON* attr = tcp ? cJSON_GetObjectItemCaseSensitive(root, "breakAttributes") : root;
+    cJSON* time = cJSON_GetObjectItemCaseSensitive(attr, "time");
+    bool valid = end == data + len && cJSON_IsObject(root) && cJSON_IsObject(attr) && cJSON_IsString(time);
+    if (valid) {
+        // TuyaOpen uses a 16-byte buffer and lexicographic timestamp ordering.
+        // Reject invalid/oversized values rather than truncating dedup identity.
+        size_t size = strlen(time->valuestring);
+        valid = size > 0 && size < 16;
+        for (size_t i = 0; valid && i < size; ++i) {
+            valid = time->valuestring[i] >= '0' && time->valuestring[i] <= '9';
+        }
+        if (valid) {
+            valid = last_interrupt_time_.empty() || last_interrupt_time_ < time->valuestring;
+            if (valid) {
+                last_interrupt_time_ = time->valuestring;
+                // Fixed-width digit string validated above; safe to convert.
+                interrupt_time_ms_ = strtoull(time->valuestring, nullptr, 10);
+            }
+        }
+    }
+    cJSON_Delete(root);
+    return valid;
+}
+
 void TuyaProtocol::HandleAudio(const uint8_t* data, size_t len,
-                                uint32_t sample_rate, uint16_t frame_duration) {
+                                uint32_t sample_rate, uint16_t frame_duration,
+                                uint8_t stream_flag, uint64_t timestamp_ms) {
+    std::lock_guard<std::mutex> lock(ctrl_mutex_);
+    // A stream START (including a header-only one with len==0) establishes the
+    // server-time boundary: a stream newer than the interruption passes.
+    if ((stream_flag == TAI_STREAM_START || stream_flag == TAI_STREAM_ONE_SHOT) &&
+        timestamp_ms > interrupt_time_ms_) {
+        interrupt_time_ms_ = 0;  // interruption cut-off no longer applies
+    }
+    if (!data || len == 0) return;  // header-only START: boundary only, no bytes
+    // Frames of the interrupted stream carry a timestamp at/before the cut-off.
+    if (interrupt_time_ms_ != 0 && timestamp_ms <= interrupt_time_ms_) return;
+    response_receiving_ = true;
+
     audio_recv_count_++;
     if (audio_recv_count_ % 50 == 1) {
         ESP_LOGI(TAG, "HandleAudio #%d: len=%d, sr=%u, fd=%u",
@@ -855,37 +971,31 @@ void TuyaProtocol::HandleAudio(const uint8_t* data, size_t len,
 
     // Tuya TTS sends raw concatenated CBR opus frames (no framing header).
     // TCP chunking may split frames across packets, so we reassemble here.
+    // Keep at most one Opus frame of scratch: copying the whole network message
+    // would retain its peak capacity (up to the fragment buffer) for the
+    // session — a problem on no-PSRAM targets.
     const size_t frame_size = TAI_OPUS_FRAME_SIZE_BYTES;
 
-    // Append incoming data to reassembly buffer
-    audio_reassembly_buf_.insert(audio_reassembly_buf_.end(), data, data + len);
-
-    // Extract complete frames
     size_t offset = 0;
-    while (offset + frame_size <= audio_reassembly_buf_.size()) {
+    while (offset < len) {
+        const size_t remaining = frame_size - audio_reassembly_buf_.size();
+        const size_t count = (len - offset < remaining) ? len - offset : remaining;
+        audio_reassembly_buf_.insert(audio_reassembly_buf_.end(), data + offset, data + offset + count);
+        offset += count;
+        if (audio_reassembly_buf_.size() < frame_size) break;
         auto pkt = std::make_unique<AudioStreamPacket>();
-        pkt->payload.assign(audio_reassembly_buf_.begin() + offset,
-                            audio_reassembly_buf_.begin() + offset + frame_size);
+        pkt->payload.assign(audio_reassembly_buf_.begin(), audio_reassembly_buf_.end());
         pkt->sample_rate = server_sample_rate_;
         pkt->frame_duration = server_frame_duration_;
+        audio_reassembly_buf_.clear();
         on_incoming_audio_(std::move(pkt));
-        offset += frame_size;
-    }
-
-    // Keep leftover bytes for next packet
-    if (offset > 0) {
-        audio_reassembly_buf_.erase(audio_reassembly_buf_.begin(),
-                                    audio_reassembly_buf_.begin() + offset);
     }
 }
 
 void TuyaProtocol::HandleText(const char* text, size_t len, uint8_t stream_flag) {
-    //ESP_LOGI(TAG, "HandleText: flag=%d len=%d text=%.*s", stream_flag, (int)len,
-    //         (int)(len > 200 ? 200 : len), text);
-    if (!on_incoming_json_) return;
-    std::string raw(text, len);
-
-    cJSON* root = cJSON_Parse(raw.c_str());
+    std::lock_guard<std::mutex> lock(ctrl_mutex_);
+    if (!text || len == 0) return;
+    cJSON* root = cJSON_ParseWithLength(text, len);
     if (!root) {
         ESP_LOGW(TAG, "HandleText: JSON parse failed");
         return;
@@ -900,6 +1010,16 @@ void TuyaProtocol::HandleText(const char* text, size_t len, uint8_t stream_flag)
             ESP_LOGW(TAG, "  key: %s", item->string ? item->string : "(null)");
             item = item->next;
         }
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (strcmp(bizType->valuestring, "NLG") == 0) {
+        // NLG is never discarded: interruption only affects the audio stream
+        // (TuyaOpen: stop playback, keep delivering transcript text).
+        response_receiving_ = true;
+    }
+    if (!on_incoming_json_) {
         cJSON_Delete(root);
         return;
     }
@@ -946,7 +1066,11 @@ void TuyaProtocol::HandleText(const char* text, size_t len, uint8_t stream_flag)
 
 void TuyaProtocol::HandleEvent(uint16_t event_type,
                                 const uint8_t* data, size_t len) {
-    //ESP_LOGI(TAG, "HandleEvent: type=%u len=%d", event_type, (int)len);
+    std::lock_guard<std::mutex> lock(ctrl_mutex_);
+    if (event_type == TAI_EVT_START) {
+        response_receiving_ = true;
+        return;
+    }
 
     if (event_type == TAI_EVT_SERVER_VAD) {
         ESP_LOGW(TAG, "[BARGE-IN] Server VAD detected end of speech (is_first=%d)", (int)is_first_audio_packet_);
@@ -960,22 +1084,40 @@ void TuyaProtocol::HandleEvent(uint16_t event_type,
             cJSON_Delete(out);
         }
     } else if (event_type == TAI_EVT_CHAT_BREAK) {
-        ESP_LOGW(TAG, "[BARGE-IN] *** CHAT_BREAK received from server! Aborting TTS. ***");
-        if (on_incoming_json_) {
-            cJSON* out = cJSON_CreateObject();
-            cJSON_AddStringToObject(out, "type", "tts");
-            cJSON_AddStringToObject(out, "state", "abort");
-            on_incoming_json_(out);
-            cJSON_Delete(out);
+        if (!realtime_mode_) return;
+        if (len > 0) {
+            const bool accepted = AcceptInterruptTime(reinterpret_cast<const char*>(data), len, true);
+            ESP_LOGI(TAG, "[BARGE-IN] TCP CHAT_BREAK timestamped len=%u accepted=%d last=%s receiving=%d",
+                     (unsigned)len, accepted, last_interrupt_time_.c_str(), response_receiving_);
+            if (!accepted) return;
+        } else {
+            ESP_LOGW(TAG, "[BARGE-IN] TCP CHAT_BREAK without timestamp (receiving=%d cutoff=%llu)",
+                     response_receiving_, (unsigned long long)interrupt_time_ms_);
         }
-        has_received_first_nlg_ = false;
+        CancelTurn(true);
     } else if (event_type == TAI_EVT_END) {
+        response_receiving_ = false;
+        audio_reassembly_buf_.clear();
+        first_tts_audio_pending_ = false;
         if (has_received_first_nlg_ && on_incoming_json_) {
-            cJSON* out = cJSON_CreateObject();
-            cJSON_AddStringToObject(out, "type", "tts");
-            cJSON_AddStringToObject(out, "state", "stop");
-            on_incoming_json_(out);
-            cJSON_Delete(out);
+            if (realtime_mode_) {
+                // Realtime: uplink is always open; the TTS stream ends and the
+                // app returns to listening immediately.
+                cJSON* out = cJSON_CreateObject();
+                cJSON_AddStringToObject(out, "type", "tts");
+                cJSON_AddStringToObject(out, "state", "stop");
+                on_incoming_json_(out);
+                cJSON_Delete(out);
+            } else {
+                // Half-duplex (C3): END only means the server finished sending.
+                // Wait until the buffered audio has actually drained to the
+                // speaker before allowing the next turn / microphone upload.
+                cJSON* out = cJSON_CreateObject();
+                cJSON_AddStringToObject(out, "type", "tts");
+                cJSON_AddStringToObject(out, "state", "stream_end");
+                on_incoming_json_(out);
+                cJSON_Delete(out);
+            }
         }
         has_received_first_nlg_ = false;
     } else if (event_type == TAI_EVT_MCP_CMD && data && len > 0) {
@@ -989,6 +1131,40 @@ void TuyaProtocol::HandleEvent(uint16_t event_type,
             cJSON_Delete(root);
         }
     }
+}
+
+// Caller holds ctrl_mutex_ through both invalidation and playback flush.
+void TuyaProtocol::CancelTurn(bool notify) {
+    // Flush current playback; audio of the interrupted stream (timestamp at or
+    // before interrupt_time_ms_) is dropped by HandleAudio. The next stream's
+    // START carries a larger server timestamp and clears the cut-off. Note:
+    // interrupt_time_ms_ is set by AcceptInterruptTime before this is called
+    // for timestamped interrupts; unscoped/unstamped breaks leave it 0, so
+    // filtering degrades to the playback flush alone.
+    audio_reassembly_buf_.clear();
+    has_received_first_nlg_ = false;
+    first_tts_audio_pending_ = false;
+    if (notify && on_incoming_json_) {
+        cJSON* out = cJSON_CreateObject();
+        cJSON_AddStringToObject(out, "type", "tts");
+        cJSON_AddStringToObject(out, "state", "abort");
+        on_incoming_json_(out);
+        cJSON_Delete(out);
+    }
+}
+
+void TuyaProtocol::HandleAiControl(const char* type, const char* json_data,
+                                   size_t data_len) {
+#if CONFIG_IDF_TARGET_ESP32C3
+    // C3 must ignore MQTT barge-in even in a server-AEC build.
+    return;
+#else
+    if (!type || strcmp(type, "asrInterrupt") != 0) return;
+    std::lock_guard<std::mutex> lock(ctrl_mutex_);
+    if (!session_active_ || !realtime_mode_) return;
+    if (!AcceptInterruptTime(json_data, data_len, false)) return;
+    CancelTurn(true);
+#endif
 }
 
 static const char* disconnect_reason_name(uint8_t reason) {
@@ -1032,6 +1208,7 @@ void TuyaProtocol::HandleDisconnect(uint8_t reason, uint8_t detail,
                                      uint16_t close_code, uint8_t connection_alive) {
     connected_ = false;
     session_active_ = false;
+    ResetReceiveState();
     if (connection_alive) {
         ESP_LOGI(TAG, "Disconnected (reason=%s detail=%s close_code=%u connection_alive=%d)",
                  disconnect_reason_name(reason), disconnect_detail_name(reason, detail),
