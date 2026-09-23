@@ -10,6 +10,7 @@
 #include <freertos/task.h>
 #include <esp_network.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <utility>
 
 #include <font_awesome.h>
@@ -65,7 +66,13 @@ void WifiBoard::StartNetwork() {
     WifiManagerConfig config;
     config.ssid_prefix = "Xiaozhi";
     config.language = Lang::CODE;
+    ESP_LOGI(TAG, "[MEM] before WiFi init: int_free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     wifi_manager.Initialize(config);
+    ESP_LOGI(TAG, "[MEM] after WiFi init: int_free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
     // Set unified event callback - forward to NetworkEvent with SSID data
     wifi_manager.SetEventCallback([this](WifiEvent event, const std::string& data) {

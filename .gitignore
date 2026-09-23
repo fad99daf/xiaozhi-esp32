@@ -30,3 +30,5 @@ auth-info.xlsx
 auth-info.xlsx.lock
 auth-info.xlsx.batch-backup.xlsx
 auth-info.xlsx.batch-journal.jsonl
+
+spec

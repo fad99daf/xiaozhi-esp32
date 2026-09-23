@@ -31,6 +31,11 @@ static const char *TAG = "tuya_ble";
 #define ADV_INTERVAL_MIN 48
 #define ADV_INTERVAL_MAX 96
 
+// GATT -> Tuya pairing/scan response -> notify -> logging shares this stack.
+// The IDF default of 4096 bytes overflows during pairing on C3.
+#define TUYA_BLE_HOST_STACK_SIZE \
+    ((CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE < 8192) ? 8192 : CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE)
+
 static const ble_uuid128_t s_write_chr_uuid = BLE_UUID128_INIT(
     0xD0, 0x07, 0x9B, 0x5F, 0x80, 0x00, 0x01, 0x80,
     0x01, 0x10, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00);
@@ -74,10 +79,14 @@ static SemaphoreHandle_t s_host_stopped;
 static void log_internal_heap(const char *stage)
 {
     const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
-    ESP_LOGI(TAG, "%s: internal free=%u largest=%u, host stack=%u", stage,
+    ESP_LOGI(TAG, "[MEM] %s: int_free=%u largest=%u min=%u dma_free=%u dma_largest=%u psram_free=%u host_stack=%u", stage,
              (unsigned)heap_caps_get_free_size(caps),
              (unsigned)heap_caps_get_largest_free_block(caps),
-             (unsigned)CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE);
+             (unsigned)heap_caps_get_minimum_free_size(caps),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             (unsigned)TUYA_BLE_HOST_STACK_SIZE);
 }
 
 // Called only by the serialized application start/stop path. On normal stop,
@@ -142,12 +151,20 @@ static void *psram_calloc(size_t n, size_t size)
 
 static int prov_buffers_alloc(void)
 {
+    ESP_LOGI(TAG, "[MEM] requested buffers: prov=%u (includes tx_queue=%u) aps=%u scan_records=%u",
+             (unsigned)sizeof(tuya_ble_prov_state_t), (unsigned)sizeof(s_prov->tx_queue),
+             (unsigned)(WIFI_SCAN_RECORDS_MAX * sizeof(tuya_ble_wifi_ap_t)),
+             (unsigned)(WIFI_SCAN_RECORDS_MAX * sizeof(wifi_ap_record_t)));
+    log_internal_heap("Before provisioning buffers");
     s_prov = psram_calloc(1, sizeof(tuya_ble_prov_state_t));
+    log_internal_heap("After provisioning state");
     s_wifi_aps = psram_calloc(WIFI_SCAN_RECORDS_MAX, sizeof(tuya_ble_wifi_ap_t));
+    log_internal_heap("After AP list buffer");
     // Scan records must be readable by the WiFi driver: DMA-capable memory.
     s_wifi_scan_records = heap_caps_calloc(WIFI_SCAN_RECORDS_MAX,
                                            sizeof(wifi_ap_record_t),
                                            MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    log_internal_heap("After WiFi scan record buffer");
     if (s_prov == NULL || s_wifi_aps == NULL || s_wifi_scan_records == NULL) {
         ESP_LOGE(TAG, "Failed to allocate prov buffers");
         free(s_prov);
@@ -176,8 +193,10 @@ static void wifi_scan_done_on_nimble(struct ble_npl_event *event)
     (void)event;
     if (!s_wifi_scan_pending) return;
     s_wifi_scan_pending = false;
+    log_internal_heap("Before WiFi list serialization");
     int rc = tuya_ble_bigdata_wifi_list_complete(s_prov, s_wifi_scan_token,
                                                 s_wifi_aps, s_wifi_ap_count);
+    log_internal_heap("After WiFi list serialization");
     if (rc != 0) {
         ESP_LOGW(TAG, "WiFi list response rejected: scan_id=%lu APs=%u rc=%d",
                  (unsigned long)s_wifi_scan_token, s_wifi_ap_count, rc);
@@ -236,6 +255,9 @@ static int wifi_scan_request(uint16_t count, const char *ccode,
         return -1;
     }
 
+    ESP_LOGI(TAG, "[MEM] before scan/STA start: int_free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     // WifiManager initializes the driver, but starts STA only after provisioning.
     if (!s_wifi_started) {
         esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
@@ -312,6 +334,11 @@ static int prov_gatt_write_access(uint16_t conn_handle, uint16_t attr_handle,
     if (tuya_ble_prov_on_data(s_prov, raw, len) != 0) {
         ESP_LOGW(TAG, "[GATT] on_data rejected %d bytes", len);
     }
+    ESP_LOGI(TAG, "[MEM] GATT processed: stack_min=%u int_free=%u largest=%u min=%u",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     return 0;
 }
 
@@ -358,7 +385,9 @@ static void prov_start_advertise(void)
     ESP_LOG_BUFFER_HEX_LEVEL(TAG, adv_data, adv_len, ESP_LOG_INFO);
     ESP_LOG_BUFFER_HEX_LEVEL(TAG, rsp_data, rsp_len, ESP_LOG_INFO);
 
+    log_internal_heap("Before advertising data");
     int rc = ble_gap_adv_set_data(adv_data, adv_len);
+    log_internal_heap("After advertising data");
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_gap_adv_set_data failed, rc=%d", rc);
         return;
@@ -377,6 +406,7 @@ static void prov_start_advertise(void)
 
     rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
                                &adv_params, prov_gap_event, NULL);
+    log_internal_heap("After advertising start");
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to start advertising, rc=%d", rc);
         ESP_LOGE(TAG, "Advertising active=%d", ble_gap_adv_active());
@@ -566,7 +596,7 @@ int tuya_ble_nimble_start(const tuya_ble_prov_cfg_t *cfg)
     const uint32_t stack_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
 #endif
     BaseType_t task_rc = xTaskCreatePinnedToCoreWithCaps(nimble_host_task, "nimble_host",
-        CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE, NULL, configMAX_PRIORITIES - 4,
+        TUYA_BLE_HOST_STACK_SIZE, NULL, configMAX_PRIORITIES - 4,
         &s_host_task, CONFIG_BT_NIMBLE_PINNED_TO_CORE, stack_caps);
     if (task_rc != pdPASS) {
         ESP_LOGE(TAG, "Host task allocation failed: rc=%d", (int)task_rc);
@@ -584,6 +614,7 @@ int tuya_ble_nimble_start(const tuya_ble_prov_cfg_t *cfg)
         return -1;
     }
 
+    log_internal_heap("After nimble_port_init (controller and host)");
     ble_hs_cfg.sync_cb = ble_on_sync;
     ble_hs_cfg.reset_cb = ble_on_reset;
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
@@ -611,11 +642,13 @@ int tuya_ble_nimble_start(const tuya_ble_prov_cfg_t *cfg)
         prov_buffers_free();
         return -1;
     }
+    log_internal_heap("After GATT registration");
     // Release our temporary netif before WifiStation creates its own on handoff.
     if (esp_netif_get_handle_from_ifkey("WIFI_STA_DEF") == NULL) {
         s_wifi_netif = esp_netif_create_default_wifi_sta();
     }
 
+    log_internal_heap("After WiFi netif setup");
     ble_npl_callout_init(&s_transport_timer, nimble_port_get_dflt_eventq(), transport_tick, NULL);
     ble_npl_event_init(&s_wifi_scan_done, wifi_scan_done_on_nimble, NULL);
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,

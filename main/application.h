@@ -7,6 +7,8 @@
 #include <esp_timer.h>
 
 #include <string>
+#include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <deque>
 #include <memory>
@@ -141,11 +143,17 @@ private:
     std::function<void(const std::string&)> mcp_broadcast_callback_;
 
     bool has_server_time_ = false;
-    bool aborted_ = false;
+    std::atomic<bool> aborted_{false};
+    // Never call the protocol while holding this mutex: callbacks hold ctrl_mutex_.
+    std::mutex tts_mutex_;
+    uint64_t tts_generation_ = 0;
+    bool tts_start_pending_ = false;  // queued tts/start admits its early audio
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
+    TaskHandle_t tts_drain_task_handle_ = nullptr;  // main-task-owned drain waiter
+    uint64_t tts_drain_generation_ = 0;
 
 
     // Event handlers
@@ -170,6 +178,10 @@ private:
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;
+    // Caller holds tts_mutex_; invalidates callbacks and flushes output immediately.
+    uint64_t CancelTtsLocked();
+    // Caller holds tts_mutex_; waits for software queues plus a 50ms DMA allowance.
+    void AwaitTtsDrain(uint64_t generation);
     
     // State change handler called by state machine
     void OnStateChanged(DeviceState old_state, DeviceState new_state);

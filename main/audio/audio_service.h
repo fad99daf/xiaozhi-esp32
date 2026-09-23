@@ -39,10 +39,19 @@
  */
 
 #define OPUS_FRAME_DURATION_MS 40
+#if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6
+// C3-class chips have ~120 KB SRAM shared with WiFi/BLE/LVGL; the upstream
+// worst-case sizes exhaust the heap. Tuya TTS sends 60 ms Opus frames.
+// Decode-queue entries hold compressed Opus (~600 B avg each), so 32 entries
+// cost ~19 KB worst case (~2 KB typical) — about 1.3 s of audio buffer.
+#define OPUS_MAX_FRAME_DURATION_MS 60
+#define MAX_DECODE_PACKETS_IN_QUEUE 32
+#else
 #define OPUS_MAX_FRAME_DURATION_MS 120
+#define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
+#endif
 #define MAX_ENCODE_TASKS_IN_QUEUE 2
 #define MAX_PLAYBACK_TASKS_IN_QUEUE 2
-#define MAX_DECODE_PACKETS_IN_QUEUE (48000 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
 #define MAX_TIMESTAMPS_IN_QUEUE 3
@@ -174,6 +183,18 @@ public:
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
+    // Capture the current output generation before a possibly-blocking push, so a
+    // packet that waited through abort/reset can be discarded by its callback.
+    uint32_t OutputGeneration() const { return output_generation_.load(); }
+    // True when the decode queue is at/above the high-water mark used for
+    // TCP-level flow control (the TAI worker stops reading, so lwIP's receive
+    // window closes — standard TCP backpressure toward the server).
+    bool IsDecodeQueueBackpressured() const;
+    // True once the speaker is actually silent: all decode/playback queues are
+    // empty AND no decode/output work is in flight. Distinct from IsIdle()
+    // (which also counts encode/testing queues) — used to gate the next
+    // half-duplex turn until the current TTS has fully drained to the speaker.
+    bool IsPlaybackDrained();
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
@@ -181,8 +202,18 @@ public:
     void SetModelsList(srmodel_list_t* models_list);
     void AbortOutput();
     void FlushAudioQueues();
+    // Release any pending WaitForPlaybackQueueEmpty waiter immediately. Called
+    // on abort so a half-duplex interrupt → new-listening turn is never gated
+    // by a drain wait belonging to the interrupted TTS.
+    void CancelDrainWait();
 
 private:
+    // High-water mark for TCP flow control. Half the hard MAX: on no-PSRAM
+    // targets the window must close early so enough internal heap stays free
+    // for the coexisting MQTT TLS write (a ~4.4 KB alloc that fails when the
+    // queue runs near-full). Reopens with hysteresis room once frames drain.
+    static constexpr size_t kDecodeQueueHighWater = MAX_DECODE_PACKETS_IN_QUEUE / 2;
+
     AudioCodec* codec_ = nullptr;
     AudioServiceCallbacks callbacks_;
     std::unique_ptr<AudioProcessor> audio_processor_;
@@ -212,7 +243,7 @@ private:
     TaskHandle_t audio_input_task_handle_ = nullptr;
     TaskHandle_t audio_output_task_handle_ = nullptr;
     TaskHandle_t opus_codec_task_handle_ = nullptr;
-    std::mutex audio_queue_mutex_;
+    mutable std::mutex audio_queue_mutex_;
     std::condition_variable audio_queue_cv_;
     std::deque<std::unique_ptr<DecodeAudioPacket>> audio_decode_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_send_queue_;
@@ -231,14 +262,32 @@ private:
     // Increment under audio_queue_mutex_ whenever queued output is invalidated.
     // Workers retain a snapshot while decoding/playing outside that mutex.
     std::atomic<uint32_t> output_generation_{0};
+    // In-flight output-side work: a packet popped from the decode queue but not
+    // yet decoded, and a PCM task popped from the playback queue but not yet
+    // written to the codec. Tracked under audio_queue_mutex_ so drain detection
+    // (IsPlaybackDrained) sees them even though the queues are empty.
+    int decode_in_flight_ = 0;
+    int playback_in_flight_ = 0;
+    // Set by CancelDrainWait to release a pending WaitForPlaybackQueueEmpty
+    // waiter; cleared when the wait actually begins.
+    bool drain_cancelled_ = false;
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;
     std::chrono::steady_clock::time_point last_output_time_;
 
+    // Reusable resample scratch buffer (avoids a per-frame multi-KB heap alloc
+    // that systematically failed with bad_alloc on no-PSRAM targets, since the
+    // output resampler is always active when server rate != codec rate).
+    std::vector<int16_t> resample_buffer_;
+
+    bool EnsureEncoderInitialized();
     void AudioInputTask();
     void AudioOutputTask();
     void OpusCodecTask();
+    void OpusCodecLoop();
+    void ProcessDecodePacket(std::unique_ptr<DecodeAudioPacket> packet, uint32_t generation);
+    void ProcessEncodeTask(std::unique_ptr<AudioTask> task);
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void CheckAndUpdateAudioPowerState();

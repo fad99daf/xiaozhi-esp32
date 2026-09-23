@@ -33,6 +33,10 @@ void AudioCodec::Start() {
         ESP_LOGW(TAG, "Output volume value (%d) is too small, setting to default (10)", output_volume_);
         output_volume_ = 10;
     }
+    if (output_volume_ > 30) {
+        ESP_LOGW(TAG, "Output volume value (%d) exceeds debug cap, clamping to 30", output_volume_);
+        output_volume_ = 30;
+    }
 
     ESP_LOGI(TAG, "Audio codec started");
 }

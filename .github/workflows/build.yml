@@ -17,8 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Audio abort regression (ASan and UBSan)
-        run: python3 -m unittest discover -s tests -p 'test_audio_abort.py' -v
+        with:
+          submodules: recursive
+      - name: Audio regressions (ASan and UBSan)
+        run: python3 -m unittest discover -s tests -p 'test_audio*.py' -v
       - name: BLE WiFi scan regression
         run: python3 -m unittest discover -s tests -p 'test_ble_wifi_scan.py' -v
 

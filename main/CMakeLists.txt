@@ -1031,6 +1031,14 @@ idf_component_register(SRCS ${SOURCES}
                         bt
                         fatfs
                         esp-agentic-kit
+                        # Audio/ML managed components (normally injected by the
+                        # component manager from idf_component.yml; declared here
+                        # so their headers resolve in offline builds too).
+                        espressif__esp-sr
+                        espressif__esp_audio_codec
+                        espressif__esp_audio_effects
+                        espressif__esp-dsp
+                        78__esp-ml307
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 
@@ -1141,8 +1149,15 @@ function(build_default_assets_bin)
         list(APPEND BUILD_ARGS "--extra_files" "${DEFAULT_ASSETS_EXTRA_FILES}")
     endif()
 
-    list(APPEND BUILD_ARGS "--esp_sr_model_path" "${ESP_SR_MODEL_PATH}")
-    list(APPEND BUILD_ARGS "--xiaozhi_fonts_path" "${XIAOZHI_FONTS_PATH}")
+    # Add asset search paths only when the component was found; an empty
+    # value would otherwise emit a dangling "--esp_sr_model_path" flag that
+    # breaks build_default_assets.py's argument parsing.
+    if(ESP_SR_MODEL_PATH)
+        list(APPEND BUILD_ARGS "--esp_sr_model_path" "${ESP_SR_MODEL_PATH}")
+    endif()
+    if(XIAOZHI_FONTS_PATH)
+        list(APPEND BUILD_ARGS "--xiaozhi_fonts_path" "${XIAOZHI_FONTS_PATH}")
+    endif()
 
     # Create custom command to build assets
     add_custom_command(

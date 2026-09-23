@@ -12,6 +12,7 @@ extern "C" {
 #include <mutex>
 #include <atomic>
 #include <vector>
+#include <string>
 
 class TuyaProtocol : public Protocol {
 public:
@@ -50,6 +51,7 @@ private:
     StaticSemaphore_t mqtt_pump_done_buffer_;
     SemaphoreHandle_t mqtt_pump_done_ = nullptr;
 
+    bool ConnectMqtt();
     bool StartMqttPump();
     void StopMqttPump();
     void MqttPumpLoop();
@@ -75,7 +77,7 @@ private:
     std::atomic<bool> connected_{false};
     std::atomic<bool> session_active_{false};
     std::atomic<bool> disconnect_cleanup_pending_{false};
-    bool is_first_audio_packet_ = true;
+    std::atomic<bool> is_first_audio_packet_{true};
     bool has_received_first_nlg_ = false;
     std::atomic<bool> audio_end_pending_{false};
     int audio_recv_count_ = 0;
@@ -94,6 +96,20 @@ private:
     int connect_fail_count_ = 0;
     static const int MAX_CONNECT_FAILS_BEFORE_REFRESH = 2;
 
+    // Serializes receive state, reassembly and audio/JSON delivery with MQTT.
+    // Callbacks must not reenter protocol methods; schedule SDK work instead.
+    std::mutex ctrl_mutex_;
+    bool realtime_mode_ = false;
+    bool response_receiving_ = false;
+    // After an interruption, drop audio frames whose media timestamp is at or
+    // before the interruption's server time; the next stream's START carries a
+    // larger timestamp and is accepted. Mirrors the SDK's time-based filtering
+    // (agentic-kit 057ffe6). NLG/text is never discarded.
+    uint64_t interrupt_time_ms_ = 0;
+    std::string last_interrupt_time_;
+    void ResetReceiveState();
+    bool AcceptInterruptTime(const char* data, size_t len, bool tcp); // ctrl_mutex_ held
+
     bool InitIotClient();
     bool FetchToken();
     bool ParseToken();
@@ -108,13 +124,21 @@ private:
                           void* user);
     static void OnDisconnectCb(tai_ctx_t* ctx, const tai_disconnect_msg_t* msg,
                                void* user);
+    // TAI receive flow control (TCP backpressure) and MQTT AI control channel.
+    static int OnFlowControlCb(tai_ctx_t* ctx, void* user);
+    static void OnAiCtrlCb(const char* type, const char* json_data,
+                           size_t data_len, void* user);
 
     void HandleAudio(const uint8_t* data, size_t len,
-                     uint32_t sample_rate, uint16_t frame_duration);
+                     uint32_t sample_rate, uint16_t frame_duration,
+                     uint8_t stream_flag, uint64_t timestamp_ms);
     void HandleText(const char* text, size_t len, uint8_t stream_flag);
+    // Borrowed callback data: attr 111 JSON for CHAT_BREAK, event payload otherwise.
     void HandleEvent(uint16_t event_type, const uint8_t* data, size_t len);
     void HandleDisconnect(uint8_t reason, uint8_t detail,
                           uint16_t close_code, uint8_t connection_alive);
+    void HandleAiControl(const char* type, const char* json_data, size_t data_len);
+    void CancelTurn(bool notify); // ctrl_mutex_ held; local abort already flushes playback
 
     bool SendText(const std::string& text) override;
 };
