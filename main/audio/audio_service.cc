@@ -1,4 +1,5 @@
 #include "audio_service.h"
+#include "music_player.h"
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <cstring>
@@ -160,6 +161,19 @@ void AudioService::Initialize(AudioCodec* codec) {
         .skip_unhandled_events = true,
     };
     esp_timer_create(&audio_power_timer_args, &audio_power_timer_);
+
+#if CONFIG_PROTOCOL_TUYA
+    music_player_ = std::make_unique<MusicPlayer>(
+        codec_,
+        [this]() { return BeginMusicPlayback(); },
+        [this](std::vector<int16_t>&& pcm, uint32_t generation) {
+            return PushPcmToPlaybackQueue(std::move(pcm), generation);
+        },
+        [this]() { WaitForMusicOutputDrained(); },
+        [this]() { CancelMusicPlayback(); },
+        [this]() { PauseMusicPlayback(); },
+        [this]() { ResumeMusicPlayback(); });
+#endif
     LogAudioHeap("processor callbacks and timer", heap);
 }
 
@@ -191,6 +205,11 @@ void AudioService::Start() {
     size_t heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     LogAudioHeap("tasks begin", heap);
     service_stopped_ = false;
+#if CONFIG_PROTOCOL_TUYA
+    if (music_player_ && !music_player_->Start()) {
+        ESP_LOGW(TAG, "Music playback task unavailable");
+    }
+#endif
     xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING);
 
     esp_timer_start_periodic(audio_power_timer_, 1000000);
@@ -241,6 +260,7 @@ void AudioService::Start() {
 }
 
 void AudioService::Stop() {
+    if (music_player_) music_player_->Shutdown();
     esp_timer_stop(audio_power_timer_);
     service_stopped_ = true;
     xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
@@ -249,9 +269,12 @@ void AudioService::Stop() {
 
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     ++output_generation_;
+    ++music_generation_;
     audio_encode_queue_.clear();
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
+    audio_music_playback_queue_.clear();
+    music_paused_ = false;
     audio_testing_queue_.clear();
     audio_queue_cv_.notify_all();
 }
@@ -365,26 +388,38 @@ void AudioService::AudioInputTask() {
 void AudioService::AudioOutputTask() {
     while (true) {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
-        audio_queue_cv_.wait(lock, [this]() { return !audio_playback_queue_.empty() || service_stopped_; });
+        audio_queue_cv_.wait(lock, [this]() {
+            return service_stopped_ || !audio_playback_queue_.empty() ||
+                   (!music_paused_ && audio_decode_queue_.empty() && decode_in_flight_ == 0 &&
+                    !audio_music_playback_queue_.empty());
+        });
         if (service_stopped_) {
             break;
         }
 
-        const auto generation = output_generation_.load();
-        auto task = std::move(audio_playback_queue_.front());
-        audio_playback_queue_.pop_front();
-        // Mark this PCM task in-flight until OutputData returns so drain
-        // detection (IsPlaybackDrained) sees it even though it left the queue.
-        playback_in_flight_++;
+        const bool is_music = audio_playback_queue_.empty();
+        const auto generation = is_music ? music_generation_.load() : output_generation_.load();
+        auto& queue = is_music ? audio_music_playback_queue_ : audio_playback_queue_;
+        auto task = std::move(queue.front());
+        queue.pop_front();
+        audio_output_busy_ = true;
+        // The TTS drain excludes retained music; music has a separate drain.
+        if (!is_music) playback_in_flight_++;
         audio_queue_cv_.notify_all();
         lock.unlock();
 
+        auto finish_output = [this, is_music]() {
+            std::lock_guard<std::mutex> queue_lock(audio_queue_mutex_);
+            audio_output_busy_ = false;
+            if (!is_music) playback_in_flight_--;
+            audio_queue_cv_.notify_all();
+        };
+
         // Check abort before playing — discards any frame already popped
         // from the queue before ResetDecoder() cleared it.
-        if (output_aborted_ || generation != output_generation_.load()) {
-            lock.lock();
-            playback_in_flight_--;
-            audio_queue_cv_.notify_all();
+        if ((is_music && generation != music_generation_.load()) ||
+            (!is_music && (output_aborted_ || generation != output_generation_.load()))) {
+            finish_output();
             continue;
         }
 
@@ -395,18 +430,16 @@ void AudioService::AudioOutputTask() {
         }
 
         // Enabling output can block while an abort/reset invalidates this frame.
-        if (output_aborted_ || generation != output_generation_.load()) {
-            lock.lock();
-            playback_in_flight_--;
-            audio_queue_cv_.notify_all();
+        if ((is_music && generation != music_generation_.load()) ||
+            (!is_music && (output_aborted_ || generation != output_generation_.load()))) {
+            finish_output();
             continue;
         }
         codec_->OutputData(task->pcm);
+        finish_output();
 
-        // Frame handed to the codec — no longer in flight.
+        // Completion above already released this task's in-flight count.
         lock.lock();
-        playback_in_flight_--;
-        audio_queue_cv_.notify_all();
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -415,7 +448,7 @@ void AudioService::AudioOutputTask() {
 #if CONFIG_USE_SERVER_AEC
         /* Record the timestamp for server AEC */
         if (task->timestamp > 0) {
-            if (generation == output_generation_.load()) {
+            if (!is_music && generation == output_generation_.load()) {
                 timestamp_queue_.push_back(task->timestamp);
             }
         }
@@ -874,9 +907,79 @@ void AudioService::PlaySound(const std::string_view& ogg) {
     LogAudioHeap("prompt queued (playback may still be active)", heap);
 }
 
+bool AudioService::HandleTuyaMusicSkill(const cJSON* skill_card) {
+    return music_player_ && music_player_->HandleSkillCard(skill_card);
+}
+
+void AudioService::NotifyMusicTurnStarted() {
+    if (music_player_) music_player_->BeginTurn();
+}
+
+void AudioService::NotifyMusicTtsStarted() {
+    if (music_player_) music_player_->NotifyTtsStarted();
+}
+
+void AudioService::NotifyMusicTtsFinished() {
+    if (music_player_) music_player_->NotifyTtsFinished();
+}
+
+void AudioService::NotifyMusicTtsAborted() {
+    if (music_player_) music_player_->NotifyTtsAborted();
+}
+
+uint32_t AudioService::BeginMusicPlayback() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    const uint32_t generation = ++music_generation_;
+    audio_music_playback_queue_.clear();
+    music_paused_ = false;
+    output_aborted_ = false;
+    audio_queue_cv_.notify_all();
+    return generation;
+}
+
+void AudioService::PauseMusicPlayback() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    music_paused_ = true;
+    audio_queue_cv_.notify_all();
+}
+
+void AudioService::ResumeMusicPlayback() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    music_paused_ = false;
+    audio_queue_cv_.notify_all();
+}
+
+void AudioService::CancelMusicPlayback() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    ++music_generation_;
+    audio_music_playback_queue_.clear();
+    music_paused_ = false;
+    audio_queue_cv_.notify_all();
+}
+
+bool AudioService::PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm, uint32_t generation) {
+    if (pcm.empty()) return true;
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    audio_queue_cv_.wait(lock, [this, generation]() {
+        return service_stopped_ || music_generation_.load() != generation ||
+               audio_music_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE;
+    });
+    if (service_stopped_ || music_generation_.load() != generation) return false;
+
+    auto task = std::make_unique<AudioTask>();
+    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task->is_music = true;
+    task->pcm = std::move(pcm);
+    audio_music_playback_queue_.push_back(std::move(task));
+    audio_queue_cv_.notify_all();
+    return true;
+}
+
 bool AudioService::IsIdle() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    return audio_encode_queue_.empty() && audio_decode_queue_.empty() && audio_playback_queue_.empty() && audio_testing_queue_.empty();
+    return audio_encode_queue_.empty() && audio_decode_queue_.empty() &&
+           audio_playback_queue_.empty() && audio_music_playback_queue_.empty() &&
+           audio_testing_queue_.empty();
 }
 
 void AudioService::WaitForPlaybackQueueEmpty() {
@@ -893,6 +996,15 @@ void AudioService::CancelDrainWait() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     drain_cancelled_ = true;
     audio_queue_cv_.notify_all();
+}
+
+void AudioService::WaitForMusicOutputDrained() {
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    audio_queue_cv_.wait(lock, [this]() {
+        return service_stopped_ || (audio_decode_queue_.empty() && decode_in_flight_ == 0 &&
+                                   audio_playback_queue_.empty() &&
+                                   audio_music_playback_queue_.empty() && !audio_output_busy_);
+    });
 }
 
 void AudioService::ResetDecoder() {
@@ -917,23 +1029,26 @@ void AudioService::FlushAudioQueues() {
     // stale microphone frames are never sent after the next reconnect.
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     ++output_generation_;
+    ++music_generation_;
     audio_encode_queue_.clear();
     audio_send_queue_.clear();
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
+    audio_music_playback_queue_.clear();
+    music_paused_ = false;
     audio_testing_queue_.clear();
     timestamp_queue_.clear();
     audio_queue_cv_.notify_all();
 }
 
 void AudioService::AbortOutput() {
-    // Stop audio output immediately: clear all queues and signal the
-    // worker tasks to drop any frames that were already popped before
-    // the clear. Called from Application::AbortSpeaking / CHAT_BREAK handler.
+    // Abort TTS immediately while retaining paused music PCM for a later
+    // PlayControl resume. Called from AbortSpeaking / CHAT_BREAK.
     // clear() destroys owned packets: serialize with every producer/consumer
     // move/pop, otherwise deque corruption and double frees are possible.
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     ++output_generation_;
+    music_paused_ = true;
     ESP_LOGW(TAG, "AbortOutput: clearing %d decode + %d playback packets",
              (int)audio_decode_queue_.size(), (int)audio_playback_queue_.size());
     output_aborted_ = true;

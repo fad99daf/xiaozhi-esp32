@@ -7,6 +7,7 @@
 #include "mqtt_protocol.h"
 #include "websocket_protocol.h"
 #include "tuya_protocol.h"
+#include "tuya_mqtt_skill.h"
 #include "assets/lang_config.h"
 #include "mcp_server.h"
 #include "assets.h"
@@ -664,6 +665,7 @@ bool Application::InitializeProtocol() {
             auto generation = tts_generation_;
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
+                audio_service_.NotifyMusicTtsStarted();
                 generation = ++tts_generation_;
                 tts_start_pending_ = true;
                 audio_service_.CancelDrainWait();
@@ -687,6 +689,13 @@ bool Application::InitializeProtocol() {
                             SetDeviceState(kDeviceStateListening);
                         }
                     }
+                    // Finish the state transition before releasing retained music.
+                    // Share the TTS generation so stale completions cannot release it.
+                    Schedule([this, generation]() {
+                        std::lock_guard<std::mutex> lock(tts_mutex_);
+                        if (generation != tts_generation_ || aborted_) return;
+                        audio_service_.NotifyMusicTtsFinished();
+                    });
                 });
             } else if (strcmp(state->valuestring, "abort") == 0) {
                 // Chat-break / MQTT interrupt: user interrupted TTS — flush now.
@@ -720,6 +729,7 @@ bool Application::InitializeProtocol() {
         } else if (strcmp(type->valuestring, "stt") == 0) {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
+                audio_service_.NotifyMusicTurnStarted();
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
                 Schedule([display, message = std::string(text->valuestring)]() {
                     display->SetChatMessage("user", message.c_str());
@@ -736,6 +746,19 @@ bool Application::InitializeProtocol() {
             auto payload = cJSON_GetObjectItem(root, "payload");
             if (cJSON_IsObject(payload)) {
                 McpServer::GetInstance().ParseMessage(payload);
+            }
+        } else if (strcmp(type->valuestring, "skill") == 0) {
+            auto payload = cJSON_GetObjectItem(root, "payload");
+            if (cJSON_IsObject(payload)) {
+                const cJSON* code = cJSON_GetObjectItem(payload, "code");
+                if (cJSON_IsString(code) &&
+                    (strcmp(code->valuestring, "music") == 0 ||
+                     strcmp(code->valuestring, "story") == 0 ||
+                     strcmp(code->valuestring, "PlayControl") == 0)) {
+                    if (!audio_service_.HandleTuyaMusicSkill(payload)) {
+                        ESP_LOGW(TAG, "Tuya AI music skill card rejected");
+                    }
+                }
             }
         } else if (strcmp(type->valuestring, "system") == 0) {
             auto command = cJSON_GetObjectItem(root, "command");
@@ -1124,6 +1147,7 @@ void Application::Schedule(std::function<void()>&& callback) {
 
 uint64_t Application::CancelTtsLocked() {
     ++tts_generation_;
+    audio_service_.NotifyMusicTtsAborted();
     aborted_ = true;
     tts_start_pending_ = false;
     audio_service_.AbortOutput();
@@ -1179,6 +1203,13 @@ void Application::AwaitTtsDrain(uint64_t generation) {
                 app->SetDeviceState(app->listening_mode_ == kListeningModeManualStop
                                     ? kDeviceStateIdle : kDeviceStateListening);
             }
+            // Half-duplex END only closes the network stream. Release music
+            // after TTS PCM drains and the state transition has been applied.
+            app->Schedule([app, generation]() {
+                std::lock_guard<std::mutex> lock(app->tts_mutex_);
+                if (generation != app->tts_generation_ || app->aborted_) return;
+                app->audio_service_.NotifyMusicTtsFinished();
+            });
         });
         vTaskDelete(NULL);
     }, "tts_drain", 3072, context, 2, &tts_drain_task_handle_) != pdPASS) {
@@ -1328,6 +1359,41 @@ void Application::SendMcpMessage(const std::string& payload) {
             mcp_broadcast_callback_(payload);
         }
     });
+}
+
+void Application::HandleTuyaMqttMessage(const std::string& payload) {
+    if (payload.empty() || payload.size() > 64 * 1024) return;
+    cJSON* root = cJSON_ParseWithLength(payload.data(), payload.size());
+    if (!root) {
+        ESP_LOGW(TAG, "Ignoring malformed Tuya MQTT JSON message");
+        return;
+    }
+
+    cJSON* text_root = nullptr;
+    const cJSON* packet_type = cJSON_GetObjectItem(root, "packet-type");
+    if (cJSON_IsString(packet_type) && strcmp(packet_type->valuestring, "text") == 0) {
+        const cJSON* packet_payload = cJSON_GetObjectItem(root, "payload");
+        const cJSON* data = cJSON_IsObject(packet_payload)
+                                ? cJSON_GetObjectItem(packet_payload, "data") : nullptr;
+        if (cJSON_IsString(data) && data->valuestring) {
+            text_root = cJSON_ParseWithLength(data->valuestring, strlen(data->valuestring));
+        }
+    }
+
+    const cJSON* skill_card = SelectTuyaMqttSkillCard(text_root ? text_root : root);
+
+    if (cJSON_IsObject(skill_card)) {
+        const cJSON* code = cJSON_GetObjectItem(skill_card, "code");
+        ESP_LOGI(TAG, "Tuya MQTT candidate skill code=%s",
+                 cJSON_IsString(code) ? code->valuestring : "(missing)");
+        const bool accepted = audio_service_.HandleTuyaMusicSkill(skill_card);
+        ESP_LOGI(TAG, "Tuya MQTT skill accepted=%d", (int)accepted);
+    } else {
+        ESP_LOGI(TAG, "Tuya MQTT message has no recognized skill card");
+    }
+
+    if (text_root) cJSON_Delete(text_root);
+    cJSON_Delete(root);
 }
 
 void Application::SetAecMode(AecMode mode) {

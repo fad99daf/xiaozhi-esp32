@@ -25,6 +25,7 @@ HARNESS = r'''
 #include <thread>
 #include <vector>
 #include "cJSON.h"
+#include "tuya_text_stream.h"
 // Stubbed TAI surface (tuya_ai.h): only the pieces the extracted methods use.
 // Kept local so the harness does not track unrelated SDK header changes.
 typedef struct tai_ctx tai_ctx_t;
@@ -79,6 +80,7 @@ size_t heap_caps_get_free_size(int) { return 0; }
 size_t heap_caps_get_minimum_free_size(int) { return 0; }
 void log_heap_delta(const char*, size_t, size_t) {}
 struct TuyaProtocol {
+    TuyaTextStream text_stream_;
     std::mutex ctrl_mutex_, send_mutex_;
     bool realtime_mode_=false, response_receiving_=false;
     uint64_t interrupt_time_ms_=0;
@@ -691,9 +693,11 @@ class TuyaInterruptTests(unittest.TestCase):
                                       '-DCONFIG_USE_SERVER_AEC=1'])):
             subprocess.run(['c++', '-std=c++17', '-pthread', '-O1', '-g',
                             '-fsanitize=address,undefined', *flags, '-I', str(CJSON),
+                            '-I', str(ROOT / 'main/protocols'),
                             '-I', str(SDK / 'modules/rtc-tcp-client/include'),
                             '-I', str(SDK / 'pal'), '-I', str(SDK / 'common'),
                             str(cls.path / 'test.cc'), str(cls.path / 'cjson.o'),
+                            str(ROOT / 'main/protocols/tuya_text_stream.cc'),
                             '-o', str(cls.path / target)], check=True, timeout=60)
 
     def run_scenario(self, name, target='s3'):

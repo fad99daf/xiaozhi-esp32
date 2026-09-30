@@ -1,4 +1,5 @@
 #include "tuya_protocol.h"
+#include "tuya_mqtt_delivery_limiter.h"
 #include "tuya_auth.h"
 #include "tuya_version_report_state.h"
 #include "settings.h"
@@ -168,6 +169,7 @@ bool TuyaProtocol::InitIotClient() {
         // started below is what actually delivers it (iot_client_process).
         cfg.reset_callback = OnCloudReset;
         cfg.reset_user_data = this;
+        cfg.message_callback = OnMqttMessage;
 
         iot_client_ = iot_client_init(&cfg);
         if (iot_client_) {
@@ -249,6 +251,37 @@ void TuyaProtocol::OnCloudReset(iot_reset_type_t type, void* user) {
     ESP_LOGW(TAG, "*** Device removed from cloud (type=%s) ***",
              type == IOT_RESET_REMOTE_FACTORY ? "factory_reset" : "remote_unbind");
     self->reset_pending_ = true;  // flag only; handled by MqttPumpLoop
+}
+
+void TuyaProtocol::OnMqttMessage(const char* topic, size_t topic_len,
+                                 const uint8_t* data, size_t data_len) {
+    (void)topic;
+    (void)topic_len;
+    constexpr size_t kMaxMqttPayloadBytes = 64 * 1024;
+    if (!data || data_len == 0 || data_len > kMaxMqttPayloadBytes) {
+        ESP_LOGW(TAG, "Ignoring invalid/oversized MQTT message (%u bytes)", (unsigned)data_len);
+        return;
+    }
+
+    // The application scheduler is unbounded. Cap the number of full MQTT
+    // payloads waiting there without blocking the IoT client's receive loop.
+    static TuyaMqttDeliveryLimiter pending_messages;
+    if (!pending_messages.TryAcquire()) {
+        ESP_LOGW(TAG, "Dropping MQTT application message: delivery queue is full");
+        return;
+    }
+
+    // Log only the callback boundary and size, never the payload: MQTT music
+    // URLs can contain signed query parameters and device identifiers.
+    ESP_LOGI(TAG, "MQTT application callback: %u bytes", (unsigned)data_len);
+
+    // The IoT client's callback runs on the MQTT pump. Parsing cards, starting
+    // network playback, or touching application state must happen elsewhere.
+    std::string payload(reinterpret_cast<const char*>(data), data_len);
+    Application::GetInstance().Schedule([payload = std::move(payload)]() {
+        Application::GetInstance().HandleTuyaMqttMessage(payload);
+        pending_messages.Release();
+    });
 }
 
 bool TuyaProtocol::ConnectMqtt() {
@@ -912,6 +945,7 @@ void TuyaProtocol::OnAiCtrlCb(const char* type, const char* json_data,
 
 void TuyaProtocol::ResetReceiveState() {
     std::lock_guard<std::mutex> lock(ctrl_mutex_);
+    text_stream_.Reset();
     response_receiving_ = false;
     interrupt_time_ms_ = 0;
     last_interrupt_time_.clear();
@@ -1016,8 +1050,17 @@ void TuyaProtocol::HandleAudio(const uint8_t* data, size_t len,
 
 void TuyaProtocol::HandleText(const char* text, size_t len, uint8_t stream_flag) {
     std::lock_guard<std::mutex> lock(ctrl_mutex_);
-    if (!text || len == 0) return;
-    cJSON* root = cJSON_ParseWithLength(text, len);
+    const auto status = text_stream_.Feed(text, len, stream_flag);
+    if (status == TuyaTextStream::Status::kPending) return;
+    if (status == TuyaTextStream::Status::kDropped) {
+        ESP_LOGW(TAG, "TAI text document dropped (flag=%u, len=%u)",
+                 (unsigned)stream_flag, (unsigned)len);
+        return;
+    }
+
+    const auto& raw = text_stream_.document();
+    cJSON* root = cJSON_ParseWithLength(raw.data(), raw.size());
+    text_stream_.Reset();
     if (!root) {
         ESP_LOGW(TAG, "HandleText: JSON parse failed");
         return;
@@ -1082,6 +1125,14 @@ void TuyaProtocol::HandleText(const char* text, size_t len, uint8_t stream_flag)
             on_incoming_json_(out);
             cJSON_Delete(out);
         }
+    } else if (strcmp(bizType->valuestring, "SKILL") == 0) {
+        cJSON* out = cJSON_CreateObject();
+        cJSON_AddStringToObject(out, "type", "skill");
+        // A reference is valid until this callback returns and avoids copying
+        // the entire skill card while internal SRAM is scarce.
+        cJSON_AddItemReferenceToObject(out, "payload", dataObj);
+        on_incoming_json_(out);
+        cJSON_Delete(out);
     }
     cJSON_Delete(root);
 }
@@ -1118,6 +1169,11 @@ void TuyaProtocol::HandleEvent(uint16_t event_type,
         }
         CancelTurn(true);
     } else if (event_type == TAI_EVT_END) {
+        if (!text_stream_.document().empty()) {
+            ESP_LOGW(TAG, "Discarding incomplete TAI text at turn end (%u bytes)",
+                     (unsigned)text_stream_.document().size());
+            text_stream_.Reset();
+        }
         response_receiving_ = false;
         audio_reassembly_buf_.clear();
         first_tts_audio_pending_ = false;
@@ -1157,6 +1213,7 @@ void TuyaProtocol::HandleEvent(uint16_t event_type,
 
 // Caller holds ctrl_mutex_ through both invalidation and playback flush.
 void TuyaProtocol::CancelTurn(bool notify) {
+    text_stream_.Reset();
     // Flush current playback; audio of the interrupted stream (timestamp at or
     // before interrupt_time_ms_) is dropped by HandleAudio. The next stream's
     // START carries a larger server timestamp and clears the cut-off. Note:

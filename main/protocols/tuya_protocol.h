@@ -2,6 +2,7 @@
 #define TUYA_PROTOCOL_H
 
 #include "protocol.h"
+#include "tuya_text_stream.h"
 extern "C" {
     #include "tuya_ai.h"
     #include "iot_client.h"
@@ -58,6 +59,8 @@ private:
     void MqttPumpLoop();
     static void MqttPumpTrampoline(void* arg);
     static void OnCloudReset(iot_reset_type_t type, void* user);
+    static void OnMqttMessage(const char* topic, size_t topic_len,
+                              const uint8_t* data, size_t data_len);
     void HandleCloudReset();
 
     struct ConnParams {
@@ -85,6 +88,7 @@ private:
     int turn_count_ = 0;
     bool first_tts_audio_pending_ = false;
     std::vector<uint8_t> audio_reassembly_buf_;
+    TuyaTextStream text_stream_;
 
     // Uplink opus batching (all accesses under send_mutex_)
     std::vector<uint8_t> audio_batch_buf_;

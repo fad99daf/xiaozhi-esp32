@@ -36,6 +36,7 @@ HARNESS = r'''
 #include <string>
 #include <thread>
 #include <vector>
+#include "main/audio/music_playback_state.h"
 
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGW(...) ((void)0)
@@ -140,6 +141,23 @@ struct AudioService {
         ++packets; return true;
     }
     uint32_t output_generation_ = 0;
+    MusicStartGate music_gate;
+    MusicPlaybackState music_state;
+    int music_finishes = 0;
+    void NotifyMusicTtsStarted() {
+        music_gate.NotifyTtsStarted(); music_state.PauseForTts();
+    }
+    void NotifyMusicTtsFinished() {
+        ++music_finishes;
+        music_gate.NotifyTtsFinished(); music_state.OnTtsFinished(music_gate);
+    }
+    void NotifyMusicTtsAborted() {
+        music_gate.NotifyTtsAborted(); music_state.PauseForTts();
+    }
+    void NotifyMusicTurnStarted() {
+        music_state.PauseForTurn(); music_gate.BeginTurn();
+    }
+    bool HandleTuyaMusicSkill(const cJSON*) { return false; }
 };
 struct Protocol {
     std::function<void(const cJSON*)> json;
@@ -464,6 +482,33 @@ int main(int argc, char** argv) {
         assert(app.audio_service_.resets == 1);
         app.protocol_->audio(std::make_unique<AudioStreamPacket>());
         assert(app.audio_service_.packets == 2);
+    } else if (test == "music_half_duplex_resume_after_drain") {
+        auto& audio = app.audio_service_;
+        audio.music_state.StartTrack();
+        app.Start();
+        assert(audio.music_state.paused());
+        assert(audio.music_state.RequestResume(audio.music_gate, true));
+        app.Tts("stream_end"); app.Pump();
+        assert(audio.music_state.paused() && audio.music_finishes == 0);
+        RunWorker();
+        assert(audio.music_state.paused());
+        app.Pump();
+        assert(app.GetDeviceState() == kDeviceStateListening);
+        assert(!audio.music_state.paused() && audio.music_finishes == 1);
+    } else if (test == "music_local_cancel_expires_tts_ticket") {
+        app.Start();
+        auto ticket = app.audio_service_.music_gate.Arm(true);
+        app.AbortSpeaking(kAbortReasonNone);
+        assert(app.audio_service_.music_gate.Expired(ticket));
+        app.Pump();
+        assert(app.audio_service_.music_finishes == 0);
+    } else if (test == "music_stale_completion_cannot_release_new_tts") {
+        app.Start(); app.Tts("stop");
+        app.Take()();  // transition applied; music release still queued
+        auto stale = app.Take();
+        app.Start(); stale();
+        assert(app.audio_service_.music_finishes == 0);
+        assert(app.audio_service_.music_gate.TtsActive());
     } else if (test == "legacy_start_stop_and_audio") {
         for (auto mode : {kListeningModeAutoStop, kListeningModeManualStop, kListeningModeRealtime}) {
             app.listening_mode_ = mode;
@@ -524,7 +569,7 @@ class AudioTtsCallbackTests(unittest.TestCase):
                                                       '-DCONFIG_IDF_TARGET_ESP32C3=1'])):
             executable = path / name
             subprocess.run(['c++', '-std=c++17', '-pthread', '-O1', '-g',
-                            '-fsanitize=address,undefined', *flags, str(path / 'test.cc'),
+                            '-fsanitize=address,undefined', '-I', str(ROOT), *flags, str(path / 'test.cc'),
                             '-o', str(executable)], check=True, timeout=60)
             cls.executables.append(executable)
 
@@ -552,6 +597,8 @@ for case in (
     'drain_cannot_clear_new_worker', 'drain_success_and_duplicate',
     'drain_creation_failure', 'compound_actions_locked', 'legacy_start_stop_and_audio',
     'tts_start_audio_before_pump_rejected',
+    'music_half_duplex_resume_after_drain', 'music_local_cancel_expires_tts_ticket',
+    'music_stale_completion_cannot_release_new_tts',
 ):
     add_case(case)
 

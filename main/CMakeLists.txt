@@ -1,6 +1,7 @@
 # Define source files
 set(SOURCES "audio/audio_codec.cc"
             "audio/audio_service.cc"
+            "audio/music_player.cc"
             "audio/demuxer/ogg_demuxer.cc"
             "audio/codecs/no_audio_codec.cc"
             "audio/codecs/box_audio_codec.cc"
@@ -30,6 +31,8 @@ set(SOURCES "audio/audio_codec.cc"
             "protocols/mqtt_protocol.cc"
             "protocols/websocket_protocol.cc"
             "protocols/tuya_protocol.cc"
+            "protocols/tuya_mqtt_skill.cc"
+            "protocols/tuya_text_stream.cc"
             "mcp_server.cc"
             "system_info.cc"
             "application.cc"
@@ -1016,6 +1019,7 @@ idf_component_register(SRCS ${SOURCES}
                         esp_pm
                         esp_psram
                         esp_netif
+                        esp_http_client
                         esp_driver_gpio
                         esp_driver_uart
                         esp_driver_spi
