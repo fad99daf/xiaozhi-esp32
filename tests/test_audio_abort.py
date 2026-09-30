@@ -1,5 +1,6 @@
 """Compile actual AudioService worker/queue methods against host codec stubs."""
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 import unittest
@@ -41,8 +42,10 @@ class AudioAbortTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             (path / 'test.cc').write_text(harness.replace('// AUDIO_SERVICE_METHODS', methods))
+            sanitizer_flags = [] if os.getenv('AUDIO_ABORT_NO_SANITIZER') == '1' else [
+                '-fsanitize=address,undefined']
             subprocess.run(['c++', '-std=c++17', '-pthread', '-O1', '-g',
-                            '-fsanitize=address,undefined', str(path / 'test.cc'), '-o', str(path / 'test')],
+                            *sanitizer_flags, str(path / 'test.cc'), '-o', str(path / 'test')],
                            check=True, timeout=60)
             subprocess.run([str(path / 'test')], check=True, timeout=30)
 

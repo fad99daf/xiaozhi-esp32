@@ -191,6 +191,7 @@ AI Agent 的行为在 Tuya IoT 平台配置:
 
 ## 相关文档
 
+- [涂鸦音乐技能背景与设备实现](docs/tuya-music-skill.md) — AI 与 MQTT 通道、卡片格式、播放与续播语义、支持范围及扩展背景
 - [Agentic-kit 介绍](https://agentic-kit.tuya.com/docs/intro/)
 - [核心概念](https://agentic-kit.tuya.com/docs/concepts) — 设备激活、配网、AI Agent、tRTC、数据点等
 - [BLE 蓝牙配网教程](https://agentic-kit.tuya.com/docs/tutorials/pair-by-ble)

@@ -111,6 +111,12 @@ struct AudioService {
     void* opus_decoder_ = (void*)1;
     std::mutex decoder_mutex_;
     std::deque<int> audio_playback_queue_, audio_encode_queue_;  // size probes only
+    bool music_paused_ = false;
+    void NotifyMusicTtsStarted() {}
+    void NotifyMusicTtsFinished() {}
+    void NotifyMusicTtsAborted() {}
+    void NotifyMusicTurnStarted() {}
+    bool HandleTuyaMusicSkill(const cJSON*) { return false; }
     void CancelDrainWait() {}
     void AbortOutput();
     void ResetDecoder();

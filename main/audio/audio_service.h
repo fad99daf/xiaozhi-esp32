@@ -27,6 +27,9 @@
 #include "protocol.h"
 #include "ogg_demuxer.h"
 
+class MusicPlayer;
+struct cJSON;
+
 /*
  * There are two types of audio data flow:
  * 1. (MIC) -> [Processors] -> {Encode Queue} -> [Opus Encoder] -> {Send Queue} -> (Server)
@@ -104,7 +107,8 @@ enum AudioTaskType {
 struct AudioTask {
     AudioTaskType type;
     std::vector<int16_t> pcm;
-    uint32_t timestamp;
+    uint32_t timestamp = 0;
+    bool is_music = false;
 };
 
 // Allocator that places allocations in PSRAM, falling back to internal RAM.
@@ -197,6 +201,16 @@ public:
     bool IsPlaybackDrained();
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
+    bool HandleTuyaMusicSkill(const cJSON* skill_card);
+    void NotifyMusicTurnStarted();
+    void NotifyMusicTtsStarted();
+    void NotifyMusicTtsFinished();
+    void NotifyMusicTtsAborted();
+    uint32_t BeginMusicPlayback();
+    void PauseMusicPlayback();
+    void ResumeMusicPlayback();
+    void CancelMusicPlayback();
+    bool PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm, uint32_t generation);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
@@ -219,6 +233,7 @@ private:
     std::unique_ptr<AudioProcessor> audio_processor_;
     std::unique_ptr<WakeWord> wake_word_;
     std::unique_ptr<AudioDebugger> audio_debugger_;
+    std::unique_ptr<MusicPlayer> music_player_;
     void* opus_encoder_ = nullptr;
     void* opus_decoder_ = nullptr;
     std::mutex decoder_mutex_;
@@ -250,6 +265,11 @@ private:
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_testing_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_;
+    // Music is buffered separately so a TTS decoder reset cannot discard its
+    // next PCM frames while a voice turn temporarily preempts playback.
+    std::deque<std::unique_ptr<AudioTask>> audio_music_playback_queue_;
+    bool music_paused_ = false;  // Guarded by audio_queue_mutex_.
+    bool audio_output_busy_ = false;
     // For server AEC
     std::deque<uint32_t> timestamp_queue_;
 
@@ -262,8 +282,10 @@ private:
     // Increment under audio_queue_mutex_ whenever queued output is invalidated.
     // Workers retain a snapshot while decoding/playing outside that mutex.
     std::atomic<uint32_t> output_generation_{0};
+    // Separate from global TTS/output invalidation: stop only music PCM.
+    std::atomic<uint32_t> music_generation_{0};
     // In-flight output-side work: a packet popped from the decode queue but not
-    // yet decoded, and a PCM task popped from the playback queue but not yet
+    // yet decoded, and a TTS PCM task popped from the playback queue but not yet
     // written to the codec. Tracked under audio_queue_mutex_ so drain detection
     // (IsPlaybackDrained) sees them even though the queues are empty.
     int decode_in_flight_ = 0;
@@ -291,6 +313,7 @@ private:
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void CheckAndUpdateAudioPowerState();
+    void WaitForMusicOutputDrained();
 };
 
 #endif

@@ -31,7 +31,7 @@ struct TestCV : std::condition_variable {
 struct AudioStreamPacket { int sample_rate=16000, frame_duration=40; uint32_t timestamp=1; std::vector<uint8_t> payload; };
 struct DecodeAudioPacket : AudioStreamPacket { ~DecodeAudioPacket() { if(packet_destroy_hook) packet_destroy_hook(); } };
 enum AudioTaskType { kAudioTaskTypeDecodeToPlaybackQueue, kAudioTaskTypeEncodeToSendQueue, kAudioTaskTypeEncodeToTestingQueue };
-struct AudioTask { AudioTaskType type; std::vector<int16_t> pcm; uint32_t timestamp=1; };
+struct AudioTask { AudioTaskType type; std::vector<int16_t> pcm; uint32_t timestamp=1; bool is_music=false; };
 struct Codec {
     bool enabled=false;
     std::atomic<int> outputs{0};
@@ -61,8 +61,11 @@ struct AudioService {
     bool service_stopped_=false;
     std::atomic<bool> output_aborted_{false};
     std::atomic<uint32_t> output_generation_{0};
+    std::atomic<uint32_t> music_generation_{0};
     std::deque<std::unique_ptr<DecodeAudioPacket>> audio_decode_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_,audio_encode_queue_;
+    std::deque<std::unique_ptr<AudioTask>> audio_music_playback_queue_;
+    bool music_paused_=false, audio_output_busy_=false;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_testing_queue_,audio_send_queue_;
     std::deque<uint32_t> timestamp_queue_;
     void *opus_decoder_=(void*)1, *opus_encoder_=nullptr, *output_resampler_=(void*)1;
@@ -166,6 +169,26 @@ int main() {
         output_hook=[&]{played.set_value();};
         service.audio_playback_queue_.push_back(std::make_unique<AudioTask>());
         std::thread worker([&]{service.AudioOutputTask();});
+        played.get_future().wait();service.stop();worker.join();
+        assert(service.codec.outputs==1);output_hook={};
+        assert(service.playback_in_flight_==0 && !service.audio_output_busy_);
+    }
+
+    // A voice abort/reset must preserve paused music and allow it to resume.
+    {
+        AudioService service;
+        service.music_paused_=true;
+        service.audio_music_playback_queue_.push_back(std::make_unique<AudioTask>());
+        service.AbortOutput(); service.ResetDecoder();
+        assert(service.audio_music_playback_queue_.size()==1);
+        std::promise<void> played;
+        output_hook=[&]{played.set_value();};
+        std::thread worker([&]{service.AudioOutputTask();});
+        {
+            std::lock_guard<std::mutex> lock(service.audio_queue_mutex_);
+            service.music_paused_=false;
+            service.audio_queue_cv_.notify_all();
+        }
         played.get_future().wait();service.stop();worker.join();
         assert(service.codec.outputs==1);output_hook={};
     }
