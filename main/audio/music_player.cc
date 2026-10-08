@@ -38,10 +38,12 @@ static const cJSON* SelectSkillContainer(const cJSON* root) {
 
 MusicPlayer::MusicPlayer(AudioCodec* codec, BeginPlayback begin_playback, PcmSink pcm_sink,
                          WaitForOutput wait_for_output, CancelOutput cancel_output,
-                         PauseOutput pause_output, ResumeOutput resume_output)
+                         PauseOutput pause_output, ResumeOutput resume_output,
+                         PlaybackFinished playback_finished, bool auto_next_enabled)
     : codec_(codec), begin_playback_(std::move(begin_playback)), pcm_sink_(std::move(pcm_sink)),
       wait_for_output_(std::move(wait_for_output)), cancel_output_(std::move(cancel_output)),
-      pause_output_(std::move(pause_output)), resume_output_(std::move(resume_output)) {
+      pause_output_(std::move(pause_output)), resume_output_(std::move(resume_output)),
+      playback_finished_(std::move(playback_finished)), auto_next_enabled_(auto_next_enabled) {
     task_stopped_ = xSemaphoreCreateBinaryStatic(&task_stopped_storage_);
 }
 
@@ -91,6 +93,8 @@ bool MusicPlayer::HandleSkillCard(const cJSON* root) {
         // Tuya PlayControl uses "stop" for pause. Keep the active stream and
         // queued PCM so a later resume card (without URLs) can continue it.
         std::lock_guard<std::mutex> lock(request_mutex_);
+        auto_next_ready_ = false;
+        auto_next_deadline_ms_ = 0;
         if (playback_state_.PauseForTurn()) {
             if (pause_output_) pause_output_();
             ESP_LOGI(TAG, "Music paused; stream retained for resume");
@@ -153,6 +157,10 @@ bool MusicPlayer::HandleSkillCard(const cJSON* root) {
         playback_state_.Stop();
         if (cancel_output_) cancel_output_();
         pending_urls_ = std::move(urls);
+        music_playlist_ = strcmp(code, "music") == 0 ||
+                          (strcmp(code, "PlayControl") == 0 && music_playlist_);
+        auto_next_ready_ = false;
+        auto_next_deadline_ms_ = 0;
         pending_ticket_ = gate_.Arm(wait_for_tts);
         request_generation_.fetch_add(1);
     }
@@ -166,6 +174,8 @@ void MusicPlayer::BeginTurn() {
     // state just because the user starts another voice turn.
     {
         std::lock_guard<std::mutex> lock(request_mutex_);
+        auto_next_ready_ = false;
+        auto_next_deadline_ms_ = 0;
         if (playback_state_.PauseForTurn()) {
             if (pause_output_) pause_output_();
         } else {
@@ -181,6 +191,8 @@ void MusicPlayer::BeginTurn() {
 
 void MusicPlayer::NotifyTtsStarted() {
     std::lock_guard<std::mutex> lock(request_mutex_);
+    auto_next_ready_ = false;
+    auto_next_deadline_ms_ = 0;
     gate_.NotifyTtsStarted();
     if (playback_state_.PauseForTts() && pause_output_) pause_output_();
 }
@@ -199,6 +211,8 @@ void MusicPlayer::NotifyTtsFinished() {
 
 void MusicPlayer::NotifyTtsAborted() {
     std::lock_guard<std::mutex> lock(request_mutex_);
+    auto_next_ready_ = false;
+    auto_next_deadline_ms_ = 0;
     gate_.NotifyTtsAborted();
     if (playback_state_.PauseForTts() && pause_output_) pause_output_();
     if (task_) xTaskNotifyGive(task_);
@@ -207,6 +221,8 @@ void MusicPlayer::NotifyTtsAborted() {
 void MusicPlayer::Stop() {
     {
         std::lock_guard<std::mutex> lock(request_mutex_);
+        auto_next_ready_ = false;
+        auto_next_deadline_ms_ = 0;
         request_generation_.fetch_add(1);
         playback_state_.Stop();
         pending_urls_.clear();
@@ -215,6 +231,33 @@ void MusicPlayer::Stop() {
         if (cancel_output_) cancel_output_();
     }
     if (task_) xTaskNotifyGive(task_);
+}
+
+bool MusicPlayer::ConsumeAutoNext(uint32_t generation, uint64_t now_ms) {
+    std::lock_guard<std::mutex> lock(request_mutex_);
+    if (!running_.load() || !auto_next_ready_ || request_generation_.load() != generation) return false;
+    auto_next_ready_ = false;
+    auto_next_deadline_ms_ = now_ms + 30000;
+    return true;
+}
+
+bool MusicPlayer::CanPublishAutoNext(uint32_t generation, uint64_t now_ms) {
+    std::lock_guard<std::mutex> lock(request_mutex_);
+    return running_.load() && request_generation_.load() == generation &&
+           auto_next_deadline_ms_ != 0 && now_ms < auto_next_deadline_ms_;
+}
+
+bool MusicPlayer::ExpireAutoNext(uint64_t now_ms) {
+    std::lock_guard<std::mutex> lock(request_mutex_);
+    if (!auto_next_deadline_ms_ || now_ms < auto_next_deadline_ms_) return false;
+    auto_next_deadline_ms_ = 0;
+    return true;
+}
+
+void MusicPlayer::CancelAutoNext() {
+    std::lock_guard<std::mutex> lock(request_mutex_);
+    auto_next_ready_ = false;
+    auto_next_deadline_ms_ = 0;
 }
 
 void MusicPlayer::TaskEntry(void* arg) {
@@ -268,19 +311,29 @@ void MusicPlayer::TaskLoop() {
             playback_generation = begin_playback_ ? begin_playback_() : 0;
             playback_state_.StartTrack();
         }
+        bool completed = true;
         for (const auto& url : urls) {
             if (IsCancelled(generation)) break;
             if (!StreamMp3(url, generation, playback_generation)) {
+                completed = false;
                 if (!IsCancelled(generation)) ESP_LOGW(TAG, "Music track download/decode failed");
                 break;
             }
         }
         // Decoding can finish while the final PCM frames are still queued.
         if (!IsCancelled(generation) && wait_for_output_) wait_for_output_();
+        bool notify_finished = false;
         {
             std::lock_guard<std::mutex> lock(request_mutex_);
-            if (!IsCancelled(generation)) playback_state_.Stop();
+            if (!IsCancelled(generation)) {
+                auto_next_ready_ = auto_next_enabled_ && music_playlist_ && completed &&
+                                   !playback_state_.paused() && !gate_.TtsActive();
+                notify_finished = auto_next_ready_;
+                playback_state_.Stop();
+            }
         }
+        // Never call application/network code with the player mutex held.
+        if (notify_finished && playback_finished_) playback_finished_(generation);
     }
 }
 
@@ -299,6 +352,7 @@ bool MusicPlayer::StreamMp3(const std::string& url, uint32_t request_generation,
     if (!http) return false;
 
     bool success = false;
+    bool received_data = false;
     void* decoder = nullptr;
     esp_ae_rate_cvt_handle_t resampler = nullptr;
     uint32_t resampler_rate = 0;
@@ -346,10 +400,11 @@ bool MusicPlayer::StreamMp3(const std::string& url, uint32_t request_generation,
             }
             // Retain one HTTP chunk as lookahead, so the parser receives EOS
             // with real final data rather than inferring it from a short read.
-            success = DecodeAvailable(decoder, encoded, request_generation, playback_generation,
+            success = received_data && DecodeAvailable(decoder, encoded, request_generation, playback_generation,
                                       &resampler, &resampler_rate, true);
             break;
         }
+        received_data = true;
         if (!DecodeAvailable(decoder, encoded, request_generation, playback_generation,
                              &resampler, &resampler_rate, false)) break;
         if (encoded.size() + (size_t)received > MUSIC_ENCODED_BUFFER_LIMIT) {

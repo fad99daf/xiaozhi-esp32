@@ -78,6 +78,8 @@ public:
     // discarded for re-provisioning. Protocols without a cloud binding return
     // false so callers keep local state intact.
     virtual bool UnbindForWifiReprovisioning() { return false; }
+    // Called by the MQTT task just before publishing, without holding protocol locks.
+    virtual bool RequestMusicNext(std::function<bool()>) { return false; }
 
 protected:
     std::function<void(const cJSON* root)> on_incoming_json_;

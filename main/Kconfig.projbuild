@@ -998,6 +998,16 @@ config PROTOCOL_TUYA
         Connect to Tuya AI cloud via the v2.1 binary protocol (ai-tcp-sdk).
         When enabled, MQTT/WebSocket protocol selection from OTA config is ignored.
 
+config TUYA_MUSIC_AUTO_NEXT
+    bool "Automatically request the next Tuya music track"
+    depends on PROTOCOL_TUYA
+    default n
+    help
+        After a music playlist finishes naturally and speaker output drains,
+        request the next track using the MQTT PlayControl skill (protocol 9000).
+        Requires cloud playback-control capability. Disabled by default.
+        Pauses, cancellations, stories and failures do not request another track.
+
 config TUYA_BLE_PROVISIONING
     bool "Use Tuya BLE for WiFi Provisioning"
     default y

@@ -96,6 +96,20 @@ void Application::Initialize() {
     callbacks.on_vad_change = [this](bool speaking) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
     };
+    callbacks.on_music_finished = [this](uint32_t generation) {
+        Schedule([this, generation]() {
+            const uint64_t now_ms = esp_timer_get_time() / 1000;
+            if (!audio_service_.ConsumeMusicAutoNext(generation, now_ms)) return;
+            if (!protocol_ || !protocol_->RequestMusicNext([this, generation]() {
+                    return audio_service_.CanPublishMusicAutoNext(generation, esp_timer_get_time() / 1000);
+                })) {
+                audio_service_.CancelMusicAutoNext();
+                ESP_LOGW(TAG, "Could not queue automatic music next request");
+                return;
+            }
+            ESP_LOGI(TAG, "Music playlist finished; automatic next queued");
+        });
+    };
     audio_service_.SetCallbacks(callbacks);
 
     // Add state change listeners
@@ -263,6 +277,9 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
+            if (audio_service_.ExpireMusicAutoNext(esp_timer_get_time() / 1000)) {
+                ESP_LOGW(TAG, "Automatic music next timed out after 30s; not retrying");
+            }
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();

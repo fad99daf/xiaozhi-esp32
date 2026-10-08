@@ -38,6 +38,38 @@ IoT MQTT 回调 → 有界投递到主任务 → 解包并选择技能卡片 ─
 
 IoT client 必须持续运行 MQTT 接收循环，不能在取得 AI session token 后立即销毁。本项目已有 `MqttPumpLoop` 负责接收、连接维护及云端重置通知，音乐复用应用消息回调，不替换这些生命周期处理。代码中关于取 token 后释放 IoT client 的旧注释不代表实际行为，当前销毁调用处于注释状态。
 
+## 可选自动下一首
+
+在 `idf.py menuconfig` 的 Xiaozhi 配置中启用
+`Automatically request the next Tuya music track`（`CONFIG_TUYA_MUSIC_AUTO_NEXT=y`）。
+默认关闭，依赖 `CONFIG_PROTOCOL_TUYA`；这是编译期开关，不是 App/技能平台上的自动连播开关。
+
+开启后，一张音乐卡片的有效 MP3 列表全部成功播放且输出队列排空，设备才请求云端下一首。
+列表内多首仍先顺序播放，只在列表耗尽时请求一次。故事、失败、取消和暂停不触发。
+用户开始新对话、停止音乐或替换列表会使尚未消费的完成通知失效；暂停后显式续播并自然播完仍可继续。
+
+请求交由现有 MQTT pump 发送，不从音乐工作线程或主任务并发调用 SDK publish：
+
+```json
+{"protocol":9000,"t":1790000000,"data":{"bizId":"music-next-example","bizType":"SKILL","data":{"code":"PlayControl","action":"next","auto":"true"}}}
+```
+
+格式对应 Polysense `SkillTopicConsumer` / `MqttBody` / `SkillBody`：参数在 `data.data`，
+`auto` 使用字符串；它不同于云端下行卡片的 `general.data`。网关根据设备上行 topic 提供设备身份，
+SDK 的 `iot_client_publish()` 负责加密和发送。云端必须已关联播控技能，并允许该设备的 MQTT 播控；
+仅打开固件开关不保证云端会返回下一首。
+
+MQTT 待发布请求最多一条，每次播放完成只消费一次通知。30 秒未收到有效新播放卡片时打印超时并停止等待；
+MQTT pump 在实际发送前重新核验播放 generation 与截止时间，丢弃停止、暂停、新对话或超时后尚未发送的请求。
+发布失败及超时均不自动重试，因为 `next` 会推进云端歌单，重试可能跳过歌曲。
+响应复用现有 `PlayControl/action=next/audios` 处理；不会自动发文本请求或要求大模型回复。
+日志可按 `automatic next queued` → `Automatic music next request published` →
+`Tuya MQTT skill accepted=1` → `Queued music playlist` 排查。
+
+当前云端响应会重新生成 `bizId`，没有原请求 ID 的可靠回显。因此无法严格识别取消或超时后迟到的自动响应，
+迟到的合法卡片仍按现有下行逻辑处理；若产品要求严格取消，应先给云端协议增加请求关联字段。
+本轮不实现循环/随机策略，也不修改云端代码。
+
 ## 技能卡片格式
 
 以下 JSON 是用于说明结构的简化示例，URL 和标识均为占位值，不是可直接播放的资源。
