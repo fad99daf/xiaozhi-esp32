@@ -100,7 +100,9 @@ void Application::Initialize() {
         Schedule([this, generation]() {
             const uint64_t now_ms = esp_timer_get_time() / 1000;
             if (!audio_service_.ConsumeMusicAutoNext(generation, now_ms)) return;
-            if (!protocol_ || !protocol_->RequestMusicNext()) {
+            if (!protocol_ || !protocol_->RequestMusicNext([this, generation]() {
+                    return audio_service_.CanPublishMusicAutoNext(generation, esp_timer_get_time() / 1000);
+                })) {
                 audio_service_.CancelMusicAutoNext();
                 ESP_LOGW(TAG, "Could not queue automatic music next request");
                 return;

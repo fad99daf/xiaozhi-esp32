@@ -43,6 +43,7 @@ public:
     void NotifyTtsAborted();
     void Stop();
     bool ConsumeAutoNext(uint32_t generation, uint64_t now_ms);
+    bool CanPublishAutoNext(uint32_t generation, uint64_t now_ms);
     bool ExpireAutoNext(uint64_t now_ms);
     void CancelAutoNext();
 

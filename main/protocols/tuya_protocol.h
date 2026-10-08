@@ -37,7 +37,7 @@ public:
     void SendAbortSpeaking(AbortReason reason) override;
     void SendMcpMessage(const std::string& payload) override;
     bool UnbindForWifiReprovisioning() override;
-    bool RequestMusicNext() override;
+    bool RequestMusicNext(std::function<bool()> can_publish) override;
 
 private:
     iot_client_t* iot_client_ = nullptr;
@@ -55,6 +55,7 @@ private:
     SemaphoreHandle_t mqtt_pump_done_ = nullptr;
     std::mutex mqtt_request_mutex_;
     std::string pending_music_request_;  // At most one; pump is the only publisher.
+    std::function<bool()> pending_music_request_valid_;
 
     bool ConnectMqtt();
     bool StartMqttPump();

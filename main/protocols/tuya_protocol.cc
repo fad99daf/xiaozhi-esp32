@@ -348,6 +348,7 @@ void TuyaProtocol::StopMqttPump() {
     {
         std::lock_guard<std::mutex> lock(mqtt_request_mutex_);
         pending_music_request_.clear();
+        pending_music_request_valid_ = {};
     }
     if (!mqtt_pump_task_) return;
 
@@ -395,11 +396,13 @@ void TuyaProtocol::MqttPumpLoop() {
         }
 
         std::string music_request;
+        std::function<bool()> can_publish;
         {
             std::lock_guard<std::mutex> lock(mqtt_request_mutex_);
             music_request.swap(pending_music_request_);
+            can_publish.swap(pending_music_request_valid_);
         }
-        if (!music_request.empty()) {
+        if (!music_request.empty() && mqtt_pump_running_.load() && can_publish && can_publish()) {
             // Keep SDK process/publish on this task. Never retry `next`: it can
             // advance the cloud playlist even if its response was lost.
             const int publish_rc = rc == OPRT_OK
@@ -904,14 +907,15 @@ void TuyaProtocol::SendMcpMessage(const std::string& payload) {
     tai_send_mcp_response(ctx_, payload.c_str());
 }
 
-bool TuyaProtocol::RequestMusicNext() {
+bool TuyaProtocol::RequestMusicNext(std::function<bool()> can_publish) {
     const std::string biz_id = "music-next-" + std::to_string(esp_timer_get_time()) +
                                "-" + std::to_string(esp_random());
     std::string request = BuildTuyaMusicNextRequest(biz_id, std::time(nullptr));
     std::lock_guard<std::mutex> lock(mqtt_request_mutex_);
-    if (request.empty() || !mqtt_pump_running_.load() || reset_pending_.load() ||
+    if (request.empty() || !can_publish || !mqtt_pump_running_.load() || reset_pending_.load() ||
         !pending_music_request_.empty()) return false;
     pending_music_request_ = std::move(request);
+    pending_music_request_valid_ = std::move(can_publish);
     return true;
 }
 

@@ -241,6 +241,12 @@ bool MusicPlayer::ConsumeAutoNext(uint32_t generation, uint64_t now_ms) {
     return true;
 }
 
+bool MusicPlayer::CanPublishAutoNext(uint32_t generation, uint64_t now_ms) {
+    std::lock_guard<std::mutex> lock(request_mutex_);
+    return running_.load() && request_generation_.load() == generation &&
+           auto_next_deadline_ms_ != 0 && now_ms < auto_next_deadline_ms_;
+}
+
 bool MusicPlayer::ExpireAutoNext(uint64_t now_ms) {
     std::lock_guard<std::mutex> lock(request_mutex_);
     if (!auto_next_deadline_ms_ || now_ms < auto_next_deadline_ms_) return false;

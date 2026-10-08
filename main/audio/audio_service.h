@@ -204,6 +204,7 @@ public:
     void PlaySound(const std::string_view& sound);
     bool HandleTuyaMusicSkill(const cJSON* skill_card);
     bool ConsumeMusicAutoNext(uint32_t generation, uint64_t now_ms);
+    bool CanPublishMusicAutoNext(uint32_t generation, uint64_t now_ms);
     bool ExpireMusicAutoNext(uint64_t now_ms);
     void CancelMusicAutoNext();
     void NotifyMusicTurnStarted();

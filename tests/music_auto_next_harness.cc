@@ -49,6 +49,7 @@ struct MusicPlayer {
     void TaskLoop();
     bool IsCancelled(uint32_t) const;
     bool ConsumeAutoNext(uint32_t, uint64_t);
+    bool CanPublishAutoNext(uint32_t, uint64_t);
     bool ExpireAutoNext(uint64_t);
     void CancelAutoNext();
     void BeginTurn();
@@ -59,6 +60,17 @@ void ulTaskNotifyTake(int, unsigned) {
     if (++notifications > 1) current->running_ = false;
 }
 void xTaskNotifyGive(void*) {}
+
+constexpr int OPRT_OK = 0;
+int published;
+int iot_client_publish(void*, const uint8_t*, size_t) { ++published; return OPRT_OK; }
+struct TuyaProtocol {
+    std::mutex mqtt_request_mutex_;
+    std::string pending_music_request_;
+    std::function<bool()> pending_music_request_valid_;
+    std::atomic<bool> mqtt_pump_running_{true};
+    void PublishPending();
+};
 
 // WORKER_METHODS
 
@@ -101,4 +113,24 @@ int main() {
     player.auto_next_ready_ = true;
     player.CancelAutoNext();
     assert(!player.ConsumeAutoNext(player.request_generation_, 40000));
+
+    for (int scenario = 0; scenario < 4; ++scenario) {
+        MusicPlayer pending_player;
+        pending_player.auto_next_ready_ = true;
+        assert(pending_player.ConsumeAutoNext(7, 1000));
+        uint64_t now = 1001;
+        TuyaProtocol transport;
+        transport.pending_music_request_ = "next";
+        transport.pending_music_request_valid_ = [&] {
+            return pending_player.CanPublishAutoNext(7, now);
+        };
+        if (scenario == 1) pending_player.Stop();
+        if (scenario == 2) now = 31000;  // Pump delayed past deadline, even without clock tick.
+        if (scenario == 3) pending_player.BeginTurn();
+        published = 0;
+        transport.PublishPending();
+        assert(published == (scenario == 0 ? 1 : 0));
+        transport.PublishPending();
+        assert(published == (scenario == 0 ? 1 : 0));  // Never retry consumed request.
+    }
 }

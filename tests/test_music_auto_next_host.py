@@ -22,8 +22,12 @@ class MusicAutoNextHostTest(unittest.TestCase):
         source = (ROOT / "main/audio/music_player.cc").read_text()
         methods = "\n".join(method(source, name) for name in (
             "MusicPlayer::TaskLoop(", "MusicPlayer::IsCancelled(",
-            "MusicPlayer::ConsumeAutoNext(", "MusicPlayer::ExpireAutoNext(",
+            "MusicPlayer::ConsumeAutoNext(", "MusicPlayer::CanPublishAutoNext(", "MusicPlayer::ExpireAutoNext(",
             "MusicPlayer::CancelAutoNext(", "MusicPlayer::BeginTurn(", "MusicPlayer::Stop("))
+        transport = (ROOT / "main/protocols/tuya_protocol.cc").read_text()
+        start = transport.index("        std::string music_request;", transport.index("void TuyaProtocol::MqttPumpLoop("))
+        end = transport.index("        if (rc != OPRT_OK)", start)
+        methods += "\nvoid TuyaProtocol::PublishPending() {\nint rc = OPRT_OK; void* client = nullptr;\n" + transport[start:end] + "\n}"
         harness = (ROOT / "tests/music_auto_next_harness.cc").read_text()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)

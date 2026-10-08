@@ -923,6 +923,10 @@ bool AudioService::ConsumeMusicAutoNext(uint32_t generation, uint64_t now_ms) {
     return music_player_ && music_player_->ConsumeAutoNext(generation, now_ms);
 }
 
+bool AudioService::CanPublishMusicAutoNext(uint32_t generation, uint64_t now_ms) {
+    return music_player_ && music_player_->CanPublishAutoNext(generation, now_ms);
+}
+
 bool AudioService::ExpireMusicAutoNext(uint64_t now_ms) {
     return music_player_ && music_player_->ExpireAutoNext(now_ms);
 }

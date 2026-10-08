@@ -60,6 +60,7 @@ SDK 的 `iot_client_publish()` 负责加密和发送。云端必须已关联播�
 仅打开固件开关不保证云端会返回下一首。
 
 MQTT 待发布请求最多一条，每次播放完成只消费一次通知。30 秒未收到有效新播放卡片时打印超时并停止等待；
+MQTT pump 在实际发送前重新核验播放 generation 与截止时间，丢弃停止、暂停、新对话或超时后尚未发送的请求。
 发布失败及超时均不自动重试，因为 `next` 会推进云端歌单，重试可能跳过歌曲。
 响应复用现有 `PlayControl/action=next/audios` 处理；不会自动发文本请求或要求大模型回复。
 日志可按 `automatic next queued` → `Automatic music next request published` →
