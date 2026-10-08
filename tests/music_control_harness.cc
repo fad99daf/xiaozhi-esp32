@@ -24,6 +24,9 @@ struct MusicPlayer {
     std::vector<std::string> pending_urls_;
     MusicStartGate::Ticket pending_ticket_{false, 0};
     std::atomic<uint32_t> request_generation_{7};
+    bool music_playlist_ = true;
+    bool auto_next_ready_ = false;
+    uint64_t auto_next_deadline_ms_ = 0;
     void* task_ = nullptr;
     std::function<void()> cancel_output_, pause_output_, resume_output_;
     bool Start() { return true; }

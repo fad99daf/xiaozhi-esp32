@@ -172,7 +172,15 @@ void AudioService::Initialize(AudioCodec* codec) {
         [this]() { WaitForMusicOutputDrained(); },
         [this]() { CancelMusicPlayback(); },
         [this]() { PauseMusicPlayback(); },
-        [this]() { ResumeMusicPlayback(); });
+        [this]() { ResumeMusicPlayback(); },
+        [this](uint32_t generation) {
+            if (callbacks_.on_music_finished) callbacks_.on_music_finished(generation);
+        },
+#if CONFIG_TUYA_MUSIC_AUTO_NEXT
+        true);
+#else
+        false);
+#endif
 #endif
     LogAudioHeap("processor callbacks and timer", heap);
 }
@@ -909,6 +917,18 @@ void AudioService::PlaySound(const std::string_view& ogg) {
 
 bool AudioService::HandleTuyaMusicSkill(const cJSON* skill_card) {
     return music_player_ && music_player_->HandleSkillCard(skill_card);
+}
+
+bool AudioService::ConsumeMusicAutoNext(uint32_t generation, uint64_t now_ms) {
+    return music_player_ && music_player_->ConsumeAutoNext(generation, now_ms);
+}
+
+bool AudioService::ExpireMusicAutoNext(uint64_t now_ms) {
+    return music_player_ && music_player_->ExpireAutoNext(now_ms);
+}
+
+void AudioService::CancelMusicAutoNext() {
+    if (music_player_) music_player_->CancelAutoNext();
 }
 
 void AudioService::NotifyMusicTurnStarted() {

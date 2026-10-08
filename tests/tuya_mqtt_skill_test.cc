@@ -54,6 +54,20 @@ static void TestPendingDeliveryIsBounded() {
 }
 
 int main() {
+    const std::string request = BuildTuyaMusicNextRequest("next-test", 1234);
+    cJSON* root = cJSON_Parse(request.c_str());
+    assert(root && cJSON_GetObjectItem(root, "protocol")->valueint == 9000);
+    const cJSON* body = cJSON_GetObjectItem(root, "data");
+    const cJSON* params = cJSON_GetObjectItem(body, "data");
+    assert(std::strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(body, "bizType")), "SKILL") == 0);
+    assert(std::strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(body, "bizId")), "next-test") == 0);
+    assert(std::strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(params, "code")), "PlayControl") == 0);
+    assert(std::strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(params, "action")), "next") == 0);
+    assert(std::strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(params, "auto")), "true") == 0);
+    cJSON_Delete(root);
+    assert(BuildTuyaMusicNextRequest("", 1234).empty());
+    assert(BuildTuyaMusicNextRequest(std::string(65, 'x'), 1234).empty());
+    assert(BuildTuyaMusicNextRequest("id", -1).empty());
     TestIotAiEnvelope();
     TestLegacyAndUnrelatedMessages();
     TestPendingDeliveryIsBounded();

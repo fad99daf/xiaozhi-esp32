@@ -26,10 +26,12 @@ public:
     using CancelOutput = std::function<void()>;
     using PauseOutput = std::function<void()>;
     using ResumeOutput = std::function<void()>;
+    using PlaybackFinished = std::function<void(uint32_t)>;
 
     MusicPlayer(AudioCodec* codec, BeginPlayback begin_playback, PcmSink pcm_sink,
                 WaitForOutput wait_for_output, CancelOutput cancel_output,
-                PauseOutput pause_output, ResumeOutput resume_output);
+                PauseOutput pause_output, ResumeOutput resume_output,
+                PlaybackFinished playback_finished = {}, bool auto_next_enabled = false);
     ~MusicPlayer();
 
     bool Start();
@@ -40,6 +42,9 @@ public:
     void NotifyTtsFinished();
     void NotifyTtsAborted();
     void Stop();
+    bool ConsumeAutoNext(uint32_t generation, uint64_t now_ms);
+    bool ExpireAutoNext(uint64_t now_ms);
+    void CancelAutoNext();
 
 private:
     static void TaskEntry(void* arg);
@@ -59,6 +64,11 @@ private:
     CancelOutput cancel_output_;
     PauseOutput pause_output_;
     ResumeOutput resume_output_;
+    PlaybackFinished playback_finished_;
+    const bool auto_next_enabled_;
+    bool music_playlist_ = false;
+    bool auto_next_ready_ = false;
+    uint64_t auto_next_deadline_ms_ = 0;  // Guarded by request_mutex_; no automatic retries.
 
     mutable std::mutex request_mutex_;
     std::vector<std::string> pending_urls_;

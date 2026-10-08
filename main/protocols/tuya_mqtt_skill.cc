@@ -4,6 +4,28 @@
 
 #include <cJSON.h>
 
+std::string BuildTuyaMusicNextRequest(const std::string& biz_id, int64_t timestamp) {
+    if (biz_id.empty() || biz_id.size() > 64 || timestamp < 0) return {};
+    cJSON* root = cJSON_CreateObject();
+    if (!root) return {};
+    cJSON* body = cJSON_AddObjectToObject(root, "data");
+    cJSON* params = body ? cJSON_AddObjectToObject(body, "data") : nullptr;
+    // Polysense MqttBody reads parameters from data.data (Map<String,String>),
+    // not a downstream skill card's general/data envelope.
+    const bool ok = params && cJSON_AddNumberToObject(root, "protocol", 9000) &&
+                    cJSON_AddNumberToObject(root, "t", static_cast<double>(timestamp)) &&
+                    cJSON_AddStringToObject(body, "bizId", biz_id.c_str()) &&
+                    cJSON_AddStringToObject(body, "bizType", "SKILL") &&
+                    cJSON_AddStringToObject(params, "code", "PlayControl") &&
+                    cJSON_AddStringToObject(params, "action", "next") &&
+                    cJSON_AddStringToObject(params, "auto", "true");
+    char* json = ok ? cJSON_PrintUnformatted(root) : nullptr;
+    std::string result = json ? json : "";
+    cJSON_free(json);
+    cJSON_Delete(root);
+    return result;
+}
+
 const cJSON* SelectTuyaMqttSkillCard(const cJSON* root) {
     if (!cJSON_IsObject(root)) return nullptr;
 

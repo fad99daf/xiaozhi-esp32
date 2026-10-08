@@ -91,6 +91,7 @@ struct cJSON;
     }
 
 struct AudioServiceCallbacks {
+    std::function<void(uint32_t)> on_music_finished;
     std::function<void(void)> on_send_queue_available;
     std::function<void(const std::string&)> on_wake_word_detected;
     std::function<void(bool)> on_vad_change;
@@ -202,6 +203,9 @@ public:
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
     bool HandleTuyaMusicSkill(const cJSON* skill_card);
+    bool ConsumeMusicAutoNext(uint32_t generation, uint64_t now_ms);
+    bool ExpireMusicAutoNext(uint64_t now_ms);
+    void CancelMusicAutoNext();
     void NotifyMusicTurnStarted();
     void NotifyMusicTtsStarted();
     void NotifyMusicTtsFinished();

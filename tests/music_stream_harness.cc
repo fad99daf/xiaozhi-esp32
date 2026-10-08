@@ -147,6 +147,8 @@ int main() {
     assert(!player.StreamMp3("https://test", 7, 9));
     reset(); http.complete = false;
     assert(!player.StreamMp3("https://test", 7, 9));
+    reset(); http.chunks.clear();
+    assert(!player.StreamMp3("https://test", 7, 9));  // Empty HTTP 200 is not a completed song.
     reset(); player.pcm_sink_ = [&](std::vector<int16_t>&&, uint32_t) {
         player.cancelled = true; return false;
     };

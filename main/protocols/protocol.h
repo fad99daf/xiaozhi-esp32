@@ -78,6 +78,7 @@ public:
     // discarded for re-provisioning. Protocols without a cloud binding return
     // false so callers keep local state intact.
     virtual bool UnbindForWifiReprovisioning() { return false; }
+    virtual bool RequestMusicNext() { return false; }
 
 protected:
     std::function<void(const cJSON* root)> on_incoming_json_;
