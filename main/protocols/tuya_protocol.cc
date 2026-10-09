@@ -1,7 +1,5 @@
 #include "tuya_protocol.h"
 #include "tuya_mqtt_delivery_limiter.h"
-#include "tuya_mqtt_skill.h"
-#include <ctime>
 #include "tuya_auth.h"
 #include "tuya_version_report_state.h"
 #include "settings.h"
@@ -15,7 +13,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_system.h>
-#include <esp_random.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <esp_heap_caps.h>
@@ -403,13 +400,13 @@ void TuyaProtocol::MqttPumpLoop() {
             can_publish.swap(pending_music_request_valid_);
         }
         if (!music_request.empty() && mqtt_pump_running_.load() && can_publish && can_publish()) {
-            // Keep SDK process/publish on this task. Never retry `next`: it can
-            // advance the cloud playlist even if its response was lost.
+            // Keep SDK process/publish on this task. Page/URL requests have one
+            // outstanding operation and an application-owned deadline.
             const int publish_rc = rc == OPRT_OK
                 ? iot_client_publish(client, reinterpret_cast<const uint8_t*>(music_request.data()),
                                      music_request.size()) : rc;
-            if (publish_rc == OPRT_OK) ESP_LOGI(TAG, "Automatic music next request published");
-            else ESP_LOGW(TAG, "Automatic music next publish failed: %d (no retry)", publish_rc);
+            if (publish_rc == OPRT_OK) ESP_LOGI(TAG, "Music catalog request published");
+            else ESP_LOGW(TAG, "Music catalog request publish failed: %d (no retry)", publish_rc);
         }
 
         if (rc != OPRT_OK) {
@@ -907,14 +904,11 @@ void TuyaProtocol::SendMcpMessage(const std::string& payload) {
     tai_send_mcp_response(ctx_, payload.c_str());
 }
 
-bool TuyaProtocol::RequestMusicNext(std::function<bool()> can_publish) {
-    const std::string biz_id = "music-next-" + std::to_string(esp_timer_get_time()) +
-                               "-" + std::to_string(esp_random());
-    std::string request = BuildTuyaMusicNextRequest(biz_id, std::time(nullptr));
+bool TuyaProtocol::RequestMusic(const std::string& request, std::function<bool()> can_publish) {
     std::lock_guard<std::mutex> lock(mqtt_request_mutex_);
-    if (request.empty() || !can_publish || !mqtt_pump_running_.load() || reset_pending_.load() ||
+    if (request.empty() || request.size() > 1024 || !can_publish || !mqtt_pump_running_.load() || reset_pending_.load() ||
         !pending_music_request_.empty()) return false;
-    pending_music_request_ = std::move(request);
+    pending_music_request_ = request;
     pending_music_request_valid_ = std::move(can_publish);
     return true;
 }

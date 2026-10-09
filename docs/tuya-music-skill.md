@@ -6,6 +6,10 @@
 
 本文按 2026 年 9 月 30 日的本地代码整理：设备音乐实现以 `e986362` 为基线；云端参考 Polysense `652c86ef6`；TuyaOpen 参考 `5112368a`。云端部分描述的是这些代码中的实现，不代表所有部署环境都已启用相同能力。
 
+2026 年 10 月 8 日补充：自动连播改为本地列表优先、云端 `music_list` 分页补充、
+`refresh_play_url` 按需取地址；同时增加 HTTP 有界断线续传。以下描述对应本地实现，
+云端接口是否已部署以及板端长时间稳定性仍需联调验证。
+
 ## 云端技能如何产生播放结果
 
 Polysense 的 `PlayMusicService.handleIntent` 查询音乐资源并获取播放地址。其返回或推送的业务内容包括技能码、播放动作、音频元数据和是否等待前置 TTS。
@@ -44,30 +48,50 @@ IoT client 必须持续运行 MQTT 接收循环，不能在取得 AI session tok
 `Automatically request the next Tuya music track`（`CONFIG_TUYA_MUSIC_AUTO_NEXT=y`）。
 默认关闭，依赖 `CONFIG_PROTOCOL_TUYA`；这是编译期开关，不是 App/技能平台上的自动连播开关。
 
-开启后，一张音乐卡片的有效 MP3 列表全部成功播放且输出队列排空，设备才请求云端下一首。
-列表内多首仍先顺序播放，只在列表耗尽时请求一次。故事、失败、取消和暂停不触发。
+开启后，先顺序播放音乐卡片中已有的有效 MP3 URL；全部成功播放且输出队列排空后，
+设备直接调用云端 `music_list`，不再发送旧的 `next + auto=true`。
+收到一页元数据后，先消耗本地当前页：每首临播放前调用 `refresh_play_url` 获取地址；
+只有当前页全部播完且 `hasMore=true`，才查询下一页。空页直接结束；`hasMore=false`
+表示播完当前页后结束。故事、失败、取消和暂停不触发。
 用户开始新对话、停止音乐或替换列表会使尚未消费的完成通知失效；暂停后显式续播并自然播完仍可继续。
+
+无需设备 MCP、无需大模型调用设备音乐搜索工具。普通语音卡片不包含原搜索条件，
+所以列表耗尽后的首次分页从 `offset=0` 开始，不发送 `keyword/tag/name/artist` 等筛选条件。
+这是云端默认检索结果，不是对原语音搜索条件的恢复，也不能保证延续同一歌手或类型。
+同一分页周期内 `offset` 按云端原始条目数推进；新的播放卡片会重置分页周期。
 
 请求交由现有 MQTT pump 发送，不从音乐工作线程或主任务并发调用 SDK publish：
 
 ```json
-{"protocol":9000,"t":1790000000,"data":{"bizId":"music-next-example","bizType":"SKILL","data":{"code":"PlayControl","action":"next","auto":"true"}}}
+{"protocol":9000,"t":1790000000,"data":{"bizId":"music-page-example","bizType":"SKILL","data":{"code":"PlayControl","action":"music_list","offset":"0","limit":"8","id":"0"}}}
 ```
 
 格式对应 Polysense `SkillTopicConsumer` / `MqttBody` / `SkillBody`：参数在 `data.data`，
-`auto` 使用字符串；它不同于云端下行卡片的 `general.data`。网关根据设备上行 topic 提供设备身份，
-SDK 的 `iot_client_publish()` 负责加密和发送。云端必须已关联播控技能，并允许该设备的 MQTT 播控；
-仅打开固件开关不保证云端会返回下一首。
+`offset/limit/id` 使用字符串；它不同于云端下行卡片的 `general.data`。网关根据设备上行 topic
+提供设备身份，SDK 的 `iot_client_publish()` 负责加密和发送。云端需要已部署并允许设备使用
+`music_list` 和 `refresh_play_url`；仅打开固件开关不保证云端会返回歌曲。
 
-MQTT 待发布请求最多一条，每次播放完成只消费一次通知。30 秒未收到有效新播放卡片时打印超时并停止等待；
+`music_list` 返回 `general.data.page` 和 `general.data.items`，条目携带 `audioId/channelCode`，
+通常没有可播放 URL。设备只缓存一页、最多 8 个条目，不把完整歌曲下载到内存。临播放时请求：
+
+```json
+{"protocol":9000,"t":1790000000,"data":{"bizId":"music-url-example","bizType":"SKILL","data":{"code":"PlayControl","action":"refresh_play_url","audioIds":"example-audio","channelCode":"demo","bitrate":"128","id":"0"}}}
+```
+
+响应必须匹配当前 `audioId`，且条目 `success=true`、`format=mp3`、`url` 有效，才进入播放器。
+地址只供本次播放使用，下一首再按需取地址，不长期缓存可能过期的 URL。
+
+MQTT 待发布请求最多一条，分页和取地址分别只允许一个在途操作。30 秒未收到有效响应时打印超时并停止等待；
 MQTT pump 在实际发送前重新核验播放 generation 与截止时间，丢弃停止、暂停、新对话或超时后尚未发送的请求。
-发布失败及超时均不自动重试，因为 `next` 会推进云端歌单，重试可能跳过歌曲。
-响应复用现有 `PlayControl/action=next/audios` 处理；不会自动发文本请求或要求大模型回复。
-日志可按 `automatic next queued` → `Automatic music next request published` →
-`Tuya MQTT skill accepted=1` → `Queued music playlist` 排查。
+发布失败及超时均不自动重试；异常页或 URL 获取失败会结束该分页周期，不无限翻页、不静默跳过歌曲。
+分页响应和播放卡片共用 TAI/MQTT 技能入口，但由 `MusicCatalog` 单独解析 `items`，不伪装成 `audios`。
+日志可按 `Music catalog request queued` → `Music catalog request published` →
+`Music catalog page accepted` → `Music catalog URL accepted` → `Starting music download` 排查。
 
-当前云端响应会重新生成 `bizId`，没有原请求 ID 的可靠回显。因此无法严格识别取消或超时后迟到的自动响应，
-迟到的合法卡片仍按现有下行逻辑处理；若产品要求严格取消，应先给云端协议增加请求关联字段。
+当前云端响应会重新生成 `bizId`，没有原请求 ID 的可靠回显。设备按在途动作、分页 `offset`、
+当前 `audioId` 和截止时间校验，拒绝没有在途请求、错误页、重复响应和超时响应。
+但新周期恰好请求同一页/同一资源时，仍无法严格区分旧周期迟到且字段相同的响应；
+若产品要求严格跨周期关联，应给云端协议增加原请求 ID 回显。
 本轮不实现循环/随机策略，也不修改云端代码。
 
 ## 技能卡片格式
@@ -199,11 +223,11 @@ SDK 应用回调中的内容也可能已经去掉外壳。当前兼容以下形�
 | `replay`、`reset` | 未实现 | 不能因解析到了 `PlayControl` 就认为动作已执行 |
 | `single_loop`、`sequential_loop`、`random_loop`、`no_loop` | 未实现 | 云端枚举存在这些动作，当前固件没有对应循环策略 |
 | `local_play`、`cloud_play` | 未实现 | 需要另外设计播放模式切换 |
-| `music_list`、`refresh_play_url` | 未实现 | 云端有基于 `general.data.items` 的实现，不是 `audios` 播放列表 |
+| `music_list`、`refresh_play_url` | 自动连播请求及响应已实现 | 使用 `general.data.items`；仅接受当前在途操作匹配的响应，不是 `audios` 播放列表 |
 
-Polysense 的 `music_list` 返回列表标识、分页信息和不含播放 URL 的资源元数据；`refresh_play_url` 返回刷新结果和 `items`。失败时也可能推送结构化错误结果。后续应按动作另写业务处理，不能把 `items` 直接当成可播放的 `audios`。
+Polysense 的 `music_list` 返回列表标识、分页信息和不含播放 URL 的资源元数据；`refresh_play_url` 返回刷新结果和 `items`。失败时也可能推送结构化错误结果。播放器通过独立分页状态处理这些动作，不能把 `items` 直接当成可播放的 `audios`。
 
-当前有效音频项必须同时满足：`format` 为小写 `mp3`，`url` 以 `http://` 或 `https://` 开头，URL 长度小于 2048 字节。仅检查数组前 16 项，过滤不支持项后按序播放；若没有有效项则拒绝卡片。`audioId`、歌名、歌手、专辑、封面和时长目前不参与播放控制，也没有实现卡片指定的自定义请求头、POST 或 `requestBody`。
+当前有效音频项必须同时满足：`format` 为小写 `mp3`，`url` 以 `http://` 或 `https://` 开头，URL 长度小于 2048 字节。普通 `audios` 卡片仅检查数组前 16 项，过滤不支持项后按序播放；若没有有效项则拒绝卡片。分页条目的 `audioId/channelCode` 用于地址查询和响应匹配；歌名、歌手、专辑、封面和时长不参与播放控制，也没有实现卡片指定的自定义请求头、POST 或 `requestBody`。
 
 ## 前置 TTS 和中断位置续播
 
@@ -213,7 +237,7 @@ Polysense 的 `music_list` 返回列表标识、分页信息和不含播放 URL 
 
 收到最终 ASR 时，应用通知播放器开始新一轮：正在播放的音乐暂停，尚未开始的列表取消。TTS 开始时也会暂停音乐。暂停保留 HTTP 连接、MP3 解码器、重采样器和待播 PCM；后续 `resume` 可在满足 TTS 门控后从保留状态继续输出。仅 TTS 结束不会自动恢复被用户暂停的音乐，需要显式续播请求。
 
-这是同一次运行期间保留流的续播，不是持久化播放进度或根据 MP3 字节比例重新定位。设备重启、替换歌曲、本地停止或连接失效后，不保证能够恢复。长时间暂停后的网络连接存活、URL 有效期及失败后的重建策略仍需产品化处理。
+这是同一次运行期间保留流的续播，不是持久化播放进度或根据 MP3 字节比例重新定位。设备重启、替换歌曲或本地停止后不恢复。长时间暂停后连接失效时可走有界 HTTP 续传，但 URL 过期、服务器不支持安全续传或重试耗尽时仍会失败。
 
 音频服务将音乐 PCM 和对话 PCM 分开排队，TTS 优先。不能让对话解码器重置、语音打断或 TTS 清理误删需要续播的音乐数据；若改动音频背压或中断代码，应重点回归这一点。
 
@@ -227,6 +251,8 @@ MP3 文件可能有 ID3 头，HTTP 分片边界也不等于 MP3 帧边界。当�
 - TAI 文本重组单文档上限为 48 KiB；MQTT 应用消息上限为 64 KiB。
 - MQTT 最多保留 2 条待处理应用消息，满时日志告警并丢弃，不阻塞 SDK 接收循环。这不是可靠业务重试或持久队列，也不代表总内存只用 128 KiB，JSON、TLS、音频等仍另占内存。
 - HTTP 每次读取 4096 字节，编码缓冲限制 64 KiB，解码输出缓冲限制 16 KiB。HTTP 客户端超时配置为 10 秒，HTTPS 使用证书 bundle 校验。
+- HTTP 瞬时错误最多重连 3 次，退避 1/2/4 秒；仅重建 HTTP，保留解码器、重采样器、编码缓存和已排队 PCM。已收到正文时要求强 ETag 一致、206、Content-Range 起点与总长度匹配；无法安全续传时停止，不从头拼接。暂停期间不重连，停止/换歌取消恢复。
+- 云端分页最多缓存 8 个资源的 ID 和渠道，超大页直接拒绝。同页重复 ID/渠道只保留一次，分页偏移仍按原始条目数推进。空页、无有效资源、URL 失败或请求超时均结束当前自动连播周期。
 - 当前未实现基于业务标识的去重、跨通道幂等或播放成功回执。重复 `play` 卡片可能替换并重新开始音乐；不能把收到卡片或 `accepted=1` 视为下载、解码和实际外放均成功。
 
 ## 排障和后续验收
@@ -240,16 +266,30 @@ MP3 文件可能有 ID3 头，HTTP 分片边界也不等于 MP3 帧边界。当�
 
 新增功能至少覆盖：AI 完整及分片卡片、MQTT 9000 和已解包卡片、`custom` 与 `general` 优先级、TTS 前后到达、无 URL 续播、暂停后替换曲目、重复消息、队列满、非法字段、不支持格式、HTTP 失败及长时间暂停。需要新动作时扩展共用业务层，不在两个通道各写一套播放逻辑；若新增去重，应明确业务标识、有效期及不同轮次的处理，不能把“同一 URL”简单视为重复。
 
+### 曲目提前结束的诊断日志
+
+INFO 保留歌曲开始、结束、控制事件及异常；元数据和约每 15 秒的下载进度改为 DEBUG，避免常态连播刷屏。不逐帧打印，也不额外保存歌曲元数据。排查短资源时，需将固件日志编译上限及 `MusicPlayer` 日志级别设为 DEBUG。日志不修改播放、重试或自动连播策略。
+
+- `Music metadata`：普通卡片或已接受的分页/URL 响应，记录 `audioId`、歌曲名、渠道、`durationMs`、`duration_raw`、码率及地址有效期。缺失数字为 `-1`，`0` 时长通常也表示未知；`duration_raw` 不猜单位。当前 Polysense 列表明确使用 `durationMs`，地址刷新和历史卡片的 `duration` 需结合资源来源确认；地址有效期不是歌曲时长。名称等字符串最多 96 字节，控制字符替换为空格。
+- `resource`：完整 URL 的 32 位日志关联散列，不打印路径、签名或查询参数；地址签名变化会改变编号，也可能碰撞。用分页和地址响应共同的 `audioId` 找歌曲，再用地址响应、开始、进度、结束共同的 `resource` 找此次下载；`gen` 区分被替换的播放请求。
+- `Music track end`：统一替代重复的 HTTP complete 日志。`outcome=completed reason=resource_eof` 表示 HTTP 确认完整收取且解码 EOF 处理成功；`bytes/total` 是已收字节和声明长度，未知总长为 `-1`。失败可见 `http_open/http_headers/http_read/http_response/body_length/reconnect_limit/no_safe_validator/decoder_init/decode_or_output/empty_resource/encoded_buffer_limit` 等原因，结合前面的错误与重连日志定位。有效 HTTP 响应后清除旧网络 errno，避免后续解码错误被误记为前一次断线。
+- `pcm_queued_ms`：按重采样后、成功提交给音乐输出队列的单声道样本数除以设备输出采样率计算；不是下载耗时，也不是实际扬声器外放证明。`wall_ms` 包含下载、解码、队列背压、暂停和重试等待。取消时，已经排队的 PCM 可能被清掉；排队时长不代表实际听完时长。
+- `Music playlist end`：位于整组 URL 处理和输出等待之后，记录结果、是否完成输出等待、是否进入自动下一首。它不是每首歌的 DAC 完成回执；输出等待结束也不能证明物理外放正常。失败后也可能先播放队列里的尾音，再结束。
+- `Music control` / 暂停、续播日志：记录语音新轮次、TTS 开始/中止、本地停止、新列表替换、服务停止等原因。`outcome=cancelled` 不是自然播放完成。暂停导致背压阻塞时可能没有定时进度日志，以控制日志为准。
+
+例如歌曲在约 30 秒正常 EOF、`bytes=total`、无重连，且 `pcm_queued_ms` 也约 30,000，则设备确实收到了约 30 秒可解码资源；若列表 `durationMs` 为 180,000，应进一步查云端供应商的短片/试听/授权返回。当前下行协议没有明确试听标记，不能凭 30 秒推断为试听版。若是 `outcome=failed` 且字节不完整，则先查网络、续传条件或解码/输出失败；若是 `cancelled` 或暂停，则查对话/播控事件。
+
 现有主机回归入口可从项目根目录运行：
 
 ```sh
 AUDIO_ABORT_NO_SANITIZER=1 python3 -m unittest \
   tests.test_music_stream_host tests.test_music_control_host \
-  tests.test_music_pipeline_host tests.test_tuya_music_skill \
+  tests.test_music_pipeline_host tests.test_music_catalog_host \
+  tests.test_music_auto_next_host tests.test_tuya_music_skill \
   tests.test_tuya_mqtt_skill_host tests.test_audio_abort -q
 ```
 
-其中流解码主机测试用脚本化替身验证调用契约、分片、消费长度、输出扩容及 EOF，不是验证乐鑫 MP3 库真实解码质量；音频中断测试在上述命令中关闭 sanitizer。实际音质、资源兼容性和板端内存仍需实机验证。
+其中流解码主机测试用脚本化替身验证调用契约、分片、消费长度、输出扩容及 EOF，不是验证乐鑫 MP3 库真实解码质量。`AUDIO_ABORT_NO_SANITIZER=1` 当前只关闭音频中断 worker 测试的 sanitizer，另一个集成测试仍固定启用；若遇 ASan 初始化异常，应单独区分运行环境问题和测试断言失败。实际音质、资源兼容性和板端内存仍需实机验证。
 
 ## 代码和资料入口
 
@@ -260,6 +300,7 @@ AUDIO_ABORT_NO_SANITIZER=1 python3 -m unittest \
 - [TAI 文本重组](../main/protocols/tuya_text_stream.cc)。
 - [应用分发与 TTS 事件](../main/application.cc)：`HandleTuyaMqttMessage` 和 `OnIncomingJson` 注册处。
 - [音乐播放器](../main/audio/music_player.cc)、[播放状态](../main/audio/music_playback_state.h)和[TTS 门控](../main/audio/music_start_gate.h)。
+- [云端分页状态](../main/audio/music_catalog.cc)和[HTTP 续传校验](../main/audio/music_http_resume.h)。
 - [音频队列与输出](../main/audio/audio_service.cc)：`HandleTuyaMusicSkill`、音乐 PCM 队列及输出仲裁。
 - [MQTT 卡片测试](../tests/tuya_mqtt_skill_test.cc)、[控制测试](../tests/test_music_control_host.py)和[流解码契约测试](../tests/test_music_stream_host.py)。
 

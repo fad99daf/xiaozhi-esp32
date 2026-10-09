@@ -1004,8 +1004,9 @@ config TUYA_MUSIC_AUTO_NEXT
     default n
     help
         After a music playlist finishes naturally and speaker output drains,
-        request the next track using the MQTT PlayControl skill (protocol 9000).
-        Requires cloud playback-control capability. Disabled by default.
+        fetch cloud music_list pages and resolve refresh_play_url on demand
+        using MQTT PlayControl (protocol 9000). Local tracks are consumed first.
+        Requires cloud catalog/URL capability. Disabled by default; no device MCP.
         Pauses, cancellations, stories and failures do not request another track.
 
 config TUYA_BLE_PROVISIONING
