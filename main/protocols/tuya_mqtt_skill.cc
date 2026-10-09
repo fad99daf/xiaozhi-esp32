@@ -4,7 +4,9 @@
 
 #include <cJSON.h>
 
-std::string BuildTuyaMusicNextRequest(const std::string& biz_id, int64_t timestamp) {
+static std::string BuildMusicRequest(const std::string& biz_id, int64_t timestamp,
+                                    const char* action, const char* key, const std::string& value,
+                                    const std::string& channel_code = {}) {
     if (biz_id.empty() || biz_id.size() > 64 || timestamp < 0) return {};
     cJSON* root = cJSON_CreateObject();
     if (!root) return {};
@@ -17,13 +19,32 @@ std::string BuildTuyaMusicNextRequest(const std::string& biz_id, int64_t timesta
                     cJSON_AddStringToObject(body, "bizId", biz_id.c_str()) &&
                     cJSON_AddStringToObject(body, "bizType", "SKILL") &&
                     cJSON_AddStringToObject(params, "code", "PlayControl") &&
-                    cJSON_AddStringToObject(params, "action", "next") &&
-                    cJSON_AddStringToObject(params, "auto", "true");
+                    cJSON_AddStringToObject(params, "action", action) &&
+                    cJSON_AddStringToObject(params, key, value.c_str()) &&
+                    cJSON_AddStringToObject(params, "id", "0") &&
+                    (strcmp(action, "music_list") == 0
+                        ? cJSON_AddStringToObject(params, "limit", std::to_string(TUYA_MUSIC_PAGE_SIZE).c_str())
+                        : cJSON_AddStringToObject(params, "bitrate", "128")) &&
+                    (channel_code.empty() || cJSON_AddStringToObject(params, "channelCode", channel_code.c_str()));
     char* json = ok ? cJSON_PrintUnformatted(root) : nullptr;
     std::string result = json ? json : "";
     cJSON_free(json);
     cJSON_Delete(root);
     return result;
+}
+
+std::string BuildTuyaMusicListRequest(const std::string& biz_id, int64_t timestamp, int offset) {
+    if (offset < 0) return {};
+    return BuildMusicRequest(biz_id, timestamp, "music_list", "offset", std::to_string(offset));
+}
+
+std::string BuildTuyaMusicUrlRequest(const std::string& biz_id, int64_t timestamp,
+                                    const std::string& audio_id, const std::string& channel_code) {
+    // The cloud accepts comma-separated audioIds. This request resolves ONE
+    // track, so reject commas/whitespace rather than resolving another ID.
+    if (audio_id.empty() || audio_id.size() > 128 || channel_code.size() > 64) return {};
+    for (unsigned char c : audio_id) if (c <= 0x20 || c == ',' || c == 0x7f) return {};
+    return BuildMusicRequest(biz_id, timestamp, "refresh_play_url", "audioIds", audio_id, channel_code);
 }
 
 const cJSON* SelectTuyaMqttSkillCard(const cJSON* root) {

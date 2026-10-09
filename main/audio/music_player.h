@@ -15,6 +15,7 @@
 #include "audio_codec.h"
 #include "music_playback_state.h"
 #include "music_start_gate.h"
+#include "music_catalog.h"
 
 struct cJSON;
 
@@ -26,12 +27,12 @@ public:
     using CancelOutput = std::function<void()>;
     using PauseOutput = std::function<void()>;
     using ResumeOutput = std::function<void()>;
-    using PlaybackFinished = std::function<void(uint32_t)>;
+    using CloudRequestReady = std::function<void(uint32_t)>;
 
     MusicPlayer(AudioCodec* codec, BeginPlayback begin_playback, PcmSink pcm_sink,
                 WaitForOutput wait_for_output, CancelOutput cancel_output,
                 PauseOutput pause_output, ResumeOutput resume_output,
-                PlaybackFinished playback_finished = {}, bool auto_next_enabled = false);
+                CloudRequestReady cloud_request_ready = {}, bool auto_next_enabled = false);
     ~MusicPlayer();
 
     bool Start();
@@ -42,7 +43,7 @@ public:
     void NotifyTtsFinished();
     void NotifyTtsAborted();
     void Stop();
-    bool ConsumeAutoNext(uint32_t generation, uint64_t now_ms);
+    std::string PrepareCloudRequest(uint32_t generation, uint64_t now_ms);
     bool CanPublishAutoNext(uint32_t generation, uint64_t now_ms);
     bool ExpireAutoNext(uint64_t now_ms);
     void CancelAutoNext();
@@ -50,12 +51,14 @@ public:
 private:
     static void TaskEntry(void* arg);
     void TaskLoop();
+    bool HandleCloudCard(const char* action, const cJSON* data);
+    void CancelCloudRequestLocked();  // Caller holds request_mutex_.
     bool StreamMp3(const std::string& url, uint32_t request_generation,
                    uint32_t playback_generation);
     bool DecodeAvailable(void* decoder, std::vector<uint8_t>& encoded,
                          uint32_t request_generation, uint32_t playback_generation,
                          esp_ae_rate_cvt_handle_t* resampler, uint32_t* resampler_rate,
-                         bool eos);
+                         bool eos, uint64_t* queued_samples);
     bool IsCancelled(uint32_t generation) const;
 
     AudioCodec* codec_;
@@ -65,11 +68,13 @@ private:
     CancelOutput cancel_output_;
     PauseOutput pause_output_;
     ResumeOutput resume_output_;
-    PlaybackFinished playback_finished_;
+    CloudRequestReady cloud_request_ready_;
     const bool auto_next_enabled_;
     bool music_playlist_ = false;
     bool auto_next_ready_ = false;
     uint64_t auto_next_deadline_ms_ = 0;  // Guarded by request_mutex_; no automatic retries.
+    MusicCatalog catalog_;  // Guarded by request_mutex_; at most one metadata page.
+    uint32_t cloud_request_sequence_ = 0;
 
     mutable std::mutex request_mutex_;
     std::vector<std::string> pending_urls_;

@@ -37,7 +37,7 @@ public:
     void SendAbortSpeaking(AbortReason reason) override;
     void SendMcpMessage(const std::string& payload) override;
     bool UnbindForWifiReprovisioning() override;
-    bool RequestMusicNext(std::function<bool()> can_publish) override;
+    bool RequestMusic(const std::string& request, std::function<bool()> can_publish) override;
 
 private:
     iot_client_t* iot_client_ = nullptr;

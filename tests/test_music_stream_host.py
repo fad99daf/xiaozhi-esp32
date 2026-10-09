@@ -27,6 +27,7 @@ class MusicStreamHostTest(unittest.TestCase):
             (path / "test.cc").write_text(harness)
             includes = ROOT / "managed_components/espressif__esp_audio_codec/include"
             subprocess.run(["c++", "-std=c++17", "-Wall", "-Wextra",
+                            "-I", str(ROOT / "main/audio"),
                             "-I", str(includes), "-I", str(includes / "decoder"),
                             str(path / "test.cc"), "-o", str(path / "test")], check=True)
             subprocess.run([str(path / "test")], check=True, timeout=10)

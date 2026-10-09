@@ -174,7 +174,7 @@ void AudioService::Initialize(AudioCodec* codec) {
         [this]() { PauseMusicPlayback(); },
         [this]() { ResumeMusicPlayback(); },
         [this](uint32_t generation) {
-            if (callbacks_.on_music_finished) callbacks_.on_music_finished(generation);
+            if (callbacks_.on_music_request) callbacks_.on_music_request(generation);
         },
 #if CONFIG_TUYA_MUSIC_AUTO_NEXT
         true);
@@ -919,8 +919,8 @@ bool AudioService::HandleTuyaMusicSkill(const cJSON* skill_card) {
     return music_player_ && music_player_->HandleSkillCard(skill_card);
 }
 
-bool AudioService::ConsumeMusicAutoNext(uint32_t generation, uint64_t now_ms) {
-    return music_player_ && music_player_->ConsumeAutoNext(generation, now_ms);
+std::string AudioService::PrepareMusicCloudRequest(uint32_t generation, uint64_t now_ms) {
+    return music_player_ ? music_player_->PrepareCloudRequest(generation, now_ms) : std::string{};
 }
 
 bool AudioService::CanPublishMusicAutoNext(uint32_t generation, uint64_t now_ms) {

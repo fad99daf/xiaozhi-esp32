@@ -23,7 +23,10 @@ class MusicControlHostTest(unittest.TestCase):
         source = (ROOT / "main/audio/music_player.cc").read_text()
         methods = "\n".join(method(source, name) for name in (
             "GetStringField(", "IsHttpUrl(", "SelectSkillContainer(",
-            "MusicPlayer::HandleSkillCard(", "MusicPlayer::BeginTurn(",
+            "LogMusicMetadata(",
+            "MusicPlayer::CancelCloudRequestLocked(",
+            "MusicPlayer::HandleSkillCard(", "MusicPlayer::HandleCloudCard(",
+            "MusicPlayer::PrepareCloudRequest(", "MusicPlayer::Shutdown(", "MusicPlayer::BeginTurn(",
             "MusicPlayer::NotifyTtsStarted(", "MusicPlayer::NotifyTtsFinished(",
             "MusicPlayer::NotifyTtsAborted(", "MusicPlayer::Stop("))
         harness = (ROOT / "tests/music_control_harness.cc").read_text()
@@ -35,5 +38,8 @@ class MusicControlHostTest(unittest.TestCase):
             subprocess.run(["c++", "-std=c++17", "-Wall", "-Wextra",
                             "-Wno-unused-variable", "-I", str(CJSON),
                             "-I", str(ROOT / "main/audio"), str(path / "test.cc"),
+                            "-I", str(ROOT / "main/protocols"),
+                            str(ROOT / "main/audio/music_catalog.cc"),
+                            str(ROOT / "main/protocols/tuya_mqtt_skill.cc"),
                             str(path / "cJSON.o"), "-o", str(path / "test")], check=True)
             subprocess.run([str(path / "test")], check=True, timeout=10)
